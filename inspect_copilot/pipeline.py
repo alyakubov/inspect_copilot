@@ -43,7 +43,11 @@ def process_pdf(pdf_path: str | Path, store: Store) -> dict:
         # Index 1: structured extraction (validated; failures quarantined)
         try:
             result = extract(pdf_path.name, ch.page, ch.language, ch.text)
-            store.add_observations(chunk_id, pdf_path.name, ch.page, result.observations)
+            addr_to_id = {
+                addr: store.get_or_create_building(addr)
+                for addr in {o.building_address for o in result.observations if o.building_address}
+            }
+            store.add_observations(chunk_id, pdf_path.name, ch.page, result.observations, addr_to_id)
             store.log(chunk_id, "ok", f"{len(result.observations)} observations")
             n_obs += len(result.observations)
         except (ValidationError, ValueError) as e:

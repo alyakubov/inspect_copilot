@@ -42,6 +42,11 @@ Rules:
   (cover pages, tables of contents, general prose) — return an empty list then.
 - regulatory_reference: fill ONLY if a norm/code is explicitly named in the text.
   If none is cited, use null. Never guess or invent a reference.
+- building_address: fill ONLY when the chunk clearly identifies which building the
+  defect belongs to. Prefer a postal address verbatim from the text (e.g.
+  "200 Main St, Springfield, IL 62701"). Fall back to a labeled name if that is
+  all the text gives (e.g. "Building A", "North Wing"). Use null when no clear
+  identifier is in the chunk — do not infer from filename, page header, or guess.
 - verbatim_quote: copy at most one short sentence from the source supporting the observation.
 - confidence: your own 0..1 confidence that this observation is correct.
 - Reports may be in English, French, or Dutch. Extract regardless of language;

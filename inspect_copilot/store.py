@@ -45,11 +45,21 @@ CREATE TABLE IF NOT EXISTS chunks (
     text        TEXT
 );
 
+CREATE TABLE IF NOT EXISTS buildings (
+    building_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_address         TEXT,
+    normalized_address  TEXT UNIQUE,
+    latitude            REAL,
+    longitude           REAL,
+    country             TEXT
+);
+
 CREATE TABLE IF NOT EXISTS observations (
     obs_id              INTEGER PRIMARY KEY AUTOINCREMENT,
     chunk_id            INTEGER REFERENCES chunks(chunk_id),
     source_file         TEXT,
     page                INTEGER,
+    building_id         INTEGER REFERENCES buildings(building_id),
     defect_type         TEXT,
     building_element    TEXT,
     material            TEXT,
@@ -71,6 +81,10 @@ CREATE TABLE IF NOT EXISTS extraction_log (
 """
 
 
+def _normalize_address(s: str) -> str:
+    return " ".join(s.lower().strip().split()).rstrip(".,;:")
+
+
 class Store:
     def __init__(self, db_path: str | Path, faiss_path: str | Path, dim: int = 384):
         self.db_path = str(db_path)
@@ -79,12 +93,21 @@ class Store:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA_SQL)
+        self._migrate_observations_building_id()
         self.conn.commit()
         # FAISS index keyed by chunk_id (IDMap lets us store our own ids)
         if Path(self.faiss_path).exists():
             self.index = faiss.read_index(self.faiss_path)
         else:
             self.index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
+
+    def _migrate_observations_building_id(self) -> None:
+        """Add observations.building_id on pre-existing DBs without wiping data."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(observations)")}
+        if "building_id" not in cols:
+            self.conn.execute(
+                "ALTER TABLE observations ADD COLUMN building_id INTEGER REFERENCES buildings(building_id)"
+            )
 
     # ---- writes (ingestion side) ----
     def add_document(self, source_file: str, n_pages: int, ocr_used: bool, language: str) -> None:
@@ -102,19 +125,44 @@ class Store:
         self.conn.commit()
         return cur.lastrowid
 
-    def add_observations(self, chunk_id: int, source_file: str, page: int, obs: list[Observation]) -> None:
+    def get_or_create_building(self, raw_address: str) -> int:
+        """Dedup by normalized_address. Returns building_id."""
+        norm = _normalize_address(raw_address)
+        row = self.conn.execute(
+            "SELECT building_id FROM buildings WHERE normalized_address = ?", (norm,)
+        ).fetchone()
+        if row:
+            return row["building_id"]
+        cur = self.conn.execute(
+            "INSERT INTO buildings (raw_address, normalized_address) VALUES (?, ?)",
+            (raw_address, norm),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def add_observations(
+        self,
+        chunk_id: int,
+        source_file: str,
+        page: int,
+        obs: list[Observation],
+        address_to_building_id: dict[str, int] | None = None,
+    ) -> None:
+        addr_map = address_to_building_id or {}
         rows = [
-            (chunk_id, source_file, page, o.defect_type.value, o.building_element, o.material,
+            (chunk_id, source_file, page,
+             addr_map.get(o.building_address) if o.building_address else None,
+             o.defect_type.value, o.building_element, o.material,
              o.severity.value, o.recommended_action, o.regulatory_reference,
              o.location_in_building, o.confidence, o.verbatim_quote)
             for o in obs
         ]
         self.conn.executemany(
             """INSERT INTO observations
-               (chunk_id,source_file,page,defect_type,building_element,material,
+               (chunk_id,source_file,page,building_id,defect_type,building_element,material,
                 severity,recommended_action,regulatory_reference,location_in_building,
                 confidence,verbatim_quote)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             rows,
         )
         self.conn.commit()

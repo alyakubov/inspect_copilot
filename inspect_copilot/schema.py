@@ -44,6 +44,14 @@ class Observation(BaseModel):
         default=None, description="Eurocode / EN norm / national code, ONLY if explicitly cited in the text"
     )
     location_in_building: Optional[str] = None
+    building_address: Optional[str] = Field(
+        default=None,
+        description=(
+            "Identifier of the building this defect is in, copied from the source text. "
+            "Prefer a postal address; fall back to a labeled name (e.g. 'Building A'). "
+            "None when no clear identifier is present in the chunk. Never invented."
+        ),
+    )
     confidence: float = Field(ge=0.0, le=1.0, description="model self-rated extraction confidence")
     verbatim_quote: str = Field(description="<=1 short sentence from the source, for audit traceability")
 
