@@ -19,7 +19,12 @@ from .store import Store
 
 _CLIENT = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 _EMBEDDER = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-_MODEL = "claude-sonnet-4-20250514"
+_MODEL = os.environ.get("ANTHROPIC_MODEL")
+if not _MODEL:
+    raise RuntimeError(
+        "ANTHROPIC_MODEL is not set. Define it in .env (see .env.example) "
+        "or export it in your shell."
+    )
 
 
 # ---------- Path 1: aggregation via SQL (exact, complete) ----------

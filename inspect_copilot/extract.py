@@ -22,7 +22,12 @@ from pydantic import ValidationError
 from .schema import ExtractionResult
 
 _CLIENT = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-_MODEL = "claude-sonnet-4-20250514"
+_MODEL = os.environ.get("ANTHROPIC_MODEL")
+if not _MODEL:
+    raise RuntimeError(
+        "ANTHROPIC_MODEL is not set. Define it in .env (see .env.example) "
+        "or export it in your shell."
+    )
 
 SYSTEM = """You extract building-defect observations from technical inspection reports.
 Return ONLY a JSON object of the form {"observations": [...]}, with no prose and no code fences.

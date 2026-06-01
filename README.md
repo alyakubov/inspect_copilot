@@ -122,7 +122,7 @@ pip install -r requirements.txt
 
 To run the app:
 ```bash
-source venv/bin/activate
+source ~/.venvs/inspect_copilot/bin/activate
 export ANTHROPIC_API_KEY=...
 streamlit run app.py
 ```

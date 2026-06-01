@@ -9,6 +9,9 @@ Four views, each mapping to a piece of the design:
 
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()  # must run before inspect_copilot imports — they create the API client at import time
+
 import pandas as pd
 import streamlit as st
 
