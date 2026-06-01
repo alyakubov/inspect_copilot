@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.idea/
+data/db/*.sqlite
+data/db/*.faiss
+.env
+.venv/
