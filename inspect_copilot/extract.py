@@ -42,6 +42,11 @@ Rules:
   (cover pages, tables of contents, general prose) — return an empty list then.
 - regulatory_reference: fill ONLY if a norm/code is explicitly named in the text.
   If none is cited, use null. Never guess or invent a reference.
+- building_element: name the structural element (facade, roof, slab, beam,
+  column, foundation, HVAC, ...) when one is implicated. Use null for defects
+  that have no specific element — typically fire-safety items (missing exit
+  sign, fire alarm inoperative, blocked egress) and similar non-structural
+  findings.
 - building_address: fill ONLY when the chunk clearly identifies which building the
   defect belongs to. Prefer a postal address verbatim from the text (e.g.
   "200 Main St, Springfield, IL 62701"). Fall back to a labeled name if that is

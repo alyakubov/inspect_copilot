@@ -1,0 +1,14 @@
+# Project-level Streamlit config. Committed to git so all contributors get the same behavior.
+
+[logger]
+# Suppress info-level messages from Streamlit's file watcher walking transformers'
+# image-processor submodules (which try to import torchvision, which we don't install).
+# The warnings are harmless — they're swallowed by transformers — but spammy.
+level = "error"
+
+[server]
+# Stops Streamlit walking every imported module on each rerun. Without this, the
+# walk triggers transformers' lazy __getattr__ on hundreds of submodules and prints
+# a deprecation warning for each one. Cost: no auto-reload on .py save — restart
+# Streamlit manually after code changes.
+fileWatcherType = "none"

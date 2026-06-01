@@ -36,7 +36,14 @@ class Observation(BaseModel):
     """One defect observation extracted from one chunk of a report."""
 
     defect_type: DefectType
-    building_element: str = Field(description="facade, roof, slab, beam, column, foundation, HVAC, ...")
+    building_element: Optional[str] = Field(
+        default=None,
+        description=(
+            "facade, roof, slab, beam, column, foundation, HVAC, ... "
+            "None when the defect has no specific structural element "
+            "(e.g. missing exit sign, fire alarm inoperative)."
+        ),
+    )
     material: Optional[str] = Field(default=None, description="concrete, steel, masonry, timber, glass, ...")
     severity: Severity
     recommended_action: Optional[str] = None

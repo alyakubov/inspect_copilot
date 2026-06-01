@@ -117,7 +117,12 @@ pip install --upgrade pip setuptools wheel
                                                                                                                                                                                                               
   # 6. Go to the project and install requirements                                                                                                                                                             
   # cd inspect_copilot  -- go to the project folder if you are not there                                        
-pip install -r requirements.txt      
+pip install -r requirements.txt  
+
+  # 5. Install tesseract for OCR processing 
+  # add tesseract-ocr-fra tesseract-ocr-nld if needed
+sudo apt-get update                                                                               
+sudo apt-get install tesseract-ocr tesseract-ocr-eng                                                                                                                        
 ```
 
 To run the app:

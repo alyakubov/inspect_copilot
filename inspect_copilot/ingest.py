@@ -46,8 +46,9 @@ def _ocr_page(page: "fitz.Page") -> str:
 
     pix = page.get_pixmap(dpi=200)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
-    # multilingual: try the languages present in a Benelux corpus
-    return pytesseract.image_to_string(img, lang="eng+fra+nld")
+    # English only for the current US-reports MVP. To handle EU reports,
+    # change to "eng+fra+nld" and install tesseract-ocr-fra / tesseract-ocr-nld.
+    return pytesseract.image_to_string(img, lang="eng")
 
 
 def ingest(pdf_path: str | Path, min_chars: int = 40) -> tuple[list[RawChunk], bool]:
