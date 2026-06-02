@@ -28,20 +28,52 @@ if not _MODEL:
 
 
 # ---------- Path 1: aggregation via SQL (exact, complete) ----------
-def top_defect_types(store: Store, material: str | None = None, limit: int = 5):
-    q = "SELECT defect_type, COUNT(*) n FROM observations"
-    params: tuple = ()
+def _filter_clause(
+    source_files: list[str] | None = None,
+    building_ids: list[int] | None = None,
+    material: str | None = None,
+) -> tuple[str, tuple]:
+    """Build a parameterised WHERE clause from optional filters. Empty/None
+    means 'no filter on this dimension'.
+    """
+    parts: list[str] = []
+    params: list = []
+    if source_files:
+        parts.append("source_file IN (" + ",".join("?" * len(source_files)) + ")")
+        params.extend(source_files)
+    if building_ids:
+        parts.append("building_id IN (" + ",".join("?" * len(building_ids)) + ")")
+        params.extend(building_ids)
     if material:
-        q += " WHERE material = ?"
-        params = (material,)
-    q += " GROUP BY defect_type ORDER BY n DESC LIMIT ?"
-    params = params + (limit,)
+        parts.append("material = ?")
+        params.append(material)
+    if parts:
+        return " WHERE " + " AND ".join(parts), tuple(params)
+    return "", ()
+
+
+def top_defect_types(
+    store: Store,
+    source_files: list[str] | None = None,
+    building_ids: list[int] | None = None,
+    material: str | None = None,
+    limit: int = 5,
+):
+    where, params = _filter_clause(source_files, building_ids, material)
+    q = (f"SELECT defect_type, COUNT(*) n FROM observations{where} "
+         "GROUP BY defect_type ORDER BY n DESC LIMIT ?")
+    return [dict(r) for r in store.sql(q, params + (limit,))]
+
+
+def severity_breakdown(
+    store: Store,
+    source_files: list[str] | None = None,
+    building_ids: list[int] | None = None,
+):
+    where, params = _filter_clause(source_files, building_ids)
+    q = (f"SELECT severity, COUNT(*) n FROM observations{where} "
+         "GROUP BY severity ORDER BY n DESC")
     return [dict(r) for r in store.sql(q, params)]
-
-
-def severity_breakdown(store: Store):
-    return [dict(r) for r in store.sql(
-        "SELECT severity, COUNT(*) n FROM observations GROUP BY severity ORDER BY n DESC")]
 
 
 def urgent_observations(store: Store):

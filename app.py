@@ -188,27 +188,51 @@ elif view == "Browse":
     if df.empty:
         st.info("No observations yet — process a report first.")
     else:
-        c1, c2 = st.columns(2)
-        dt = c1.multiselect("Defect type", sorted(df.defect_type.unique()))
-        sev = c2.multiselect("Severity", sorted(df.severity.unique()))
+        c1, c2, c3 = st.columns(3)
+        src = c1.multiselect("Report", sorted(df.source_file.unique()))
+        dt = c2.multiselect("Defect type", sorted(df.defect_type.unique()))
+        sev = c3.multiselect("Severity", sorted(df.severity.unique()))
+        if src:
+            df = df[df.source_file.isin(src)]
         if dt:
             df = df[df.defect_type.isin(dt)]
         if sev:
             df = df[df.severity.isin(sev)]
+        st.caption(f"{len(df)} of {len(rows)} observations")
         st.dataframe(df, use_container_width=True)
 
 elif view == "Analytics":
     st.header("Portfolio analytics")
-    top = query.top_defect_types(store, limit=10)
-    sev = query.severity_breakdown(store)
+
+    # Filter options from current DB state
+    report_choices = [r["source_file"] for r in store.sql(
+        "SELECT DISTINCT source_file FROM observations ORDER BY source_file")]
+    building_rows = store.sql(
+        "SELECT building_id, COALESCE(canonical_address, raw_address) AS name "
+        "FROM buildings ORDER BY name"
+    )
+    building_label_to_id = {b["name"]: b["building_id"] for b in building_rows}
+
+    f1, f2 = st.columns(2)
+    sel_reports = f1.multiselect("Report", report_choices)
+    sel_building_labels = f2.multiselect("Building", list(building_label_to_id.keys()))
+    sel_building_ids = [building_label_to_id[n] for n in sel_building_labels]
+
+    top = query.top_defect_types(store, source_files=sel_reports or None,
+                                 building_ids=sel_building_ids or None, limit=10)
+    sev = query.severity_breakdown(store, source_files=sel_reports or None,
+                                   building_ids=sel_building_ids or None)
     if not top:
-        st.info("No data yet.")
+        st.info("No observations match these filters.")
     else:
+        n_match = sum(r["n"] for r in top)
+        filtered = bool(sel_reports or sel_building_ids)
+        st.caption(f"{n_match} observations" + (" (filtered)" if filtered else ""))
         c1, c2 = st.columns(2)
         c1.subheader("Most frequent defect types")
-        c1.bar_chart(pd.DataFrame(top).set_index("defect_type"))
+        c1.bar_chart(pd.DataFrame(top).set_index("defect_type"), height=400)
         c2.subheader("Severity distribution")
-        c2.bar_chart(pd.DataFrame(sev).set_index("severity"))
+        c2.bar_chart(pd.DataFrame(sev).set_index("severity"), height=400)
 
 elif view == "Ask":
     st.header("Ask the corpus (semantic)")
