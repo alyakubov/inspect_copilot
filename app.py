@@ -58,6 +58,33 @@ if view == "Process":
         st.subheader("Extraction log")
         st.table(pd.DataFrame([dict(r) for r in log]))
 
+    st.subheader("Processed reports")
+    docs = store.sql(
+        "SELECT d.rowid AS report_id, d.source_file, d.n_pages, "
+        "       (SELECT COUNT(*) FROM observations o WHERE o.source_file = d.source_file) AS n_obs "
+        "FROM documents d ORDER BY d.rowid"
+    )
+    if not docs:
+        st.caption("No reports yet.")
+    else:
+        for d in docs:
+            cols = st.columns([1, 6, 3, 2])
+            cols[0].markdown(f"**#{d['report_id']}**")
+            cols[1].write(d['source_file'])
+            cols[2].caption(f"{d['n_pages']} pages · {d['n_obs']} obs")
+            if cols[3].button("🗑 Delete", key=f"del_report_{d['report_id']}"):
+                stats = store.delete_report(d['source_file'])
+                pdf_path = Path("data/raw") / d['source_file']
+                if pdf_path.exists():
+                    pdf_path.unlink()
+                st.toast(
+                    f"Deleted #{d['report_id']}: "
+                    f"{stats['observations']} obs, {stats['chunks']} chunks, "
+                    f"{stats['buildings_deleted']} buildings, "
+                    f"{stats['audit_cleaned']} audit entries"
+                )
+                st.rerun()
+
 elif view == "Buildings":
     st.header("Buildings")
     buildings = store.sql(
@@ -105,6 +132,13 @@ elif view == "Buildings":
                     f"{row['flag_reasoning']}\n\nIf they really are the same "
                     "building, use **Merge into another building** below."
                 )
+            if st.button(
+                "Dismiss flag (mark as reviewed)",
+                key=f"dismiss_{row['building_id']}",
+            ):
+                store.dismiss_flag(row['building_id'])
+                st.toast("Flag dismissed. This building won't be re-flagged on future runs.")
+                st.rerun()
 
         # Edit / merge panel — auto-opens for flagged buildings
         with st.expander("Edit / merge this building", expanded=bool(row['flag'])):

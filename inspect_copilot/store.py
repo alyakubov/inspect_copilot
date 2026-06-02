@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS buildings (
     flag                          TEXT,             -- LLM concern: ambiguous_name | possible_duplicate
     flag_reasoning                TEXT,             -- short LLM rationale shown in the UI
     possibly_same_as_building_id  INTEGER REFERENCES buildings(building_id),  -- for possible_duplicate
+    human_reviewed                INTEGER NOT NULL DEFAULT 0,  -- 1 = user dismissed / resolved; do not auto-flag again
     latitude                      REAL,
     longitude                     REAL,
     country                       TEXT
@@ -181,6 +182,16 @@ class Store:
                 "ALTER TABLE buildings ADD COLUMN possibly_same_as_building_id "
                 "INTEGER REFERENCES buildings(building_id)"
             )
+        if "human_reviewed" not in bcols:
+            self.conn.execute(
+                "ALTER TABLE buildings ADD COLUMN human_reviewed INTEGER NOT NULL DEFAULT 0"
+            )
+            # On first migration, treat all currently-unflagged buildings as
+            # already reviewed — they were either resolved by the user before
+            # or never needed flagging. Either way, don't re-flag on next run.
+            self.conn.execute(
+                "UPDATE buildings SET human_reviewed=1 WHERE flag IS NULL"
+            )
 
     # ---- writes (ingestion side) ----
     def add_document(self, source_file: str, n_pages: int, ocr_used: bool, language: str) -> None:
@@ -301,12 +312,18 @@ class Store:
     def apply_concerns(self, concerns: list[dict]) -> int:
         """Record LLM-flagged concerns about extracted buildings (ambiguous names,
         possible duplicates the LLM lacked evidence to merge). Each concern sets
-        flag / flag_reasoning / possibly_same_as_building_id on the row. Returns
-        number of flags written. Hallucinated ids are silently dropped.
+        flag / flag_reasoning / possibly_same_as_building_id on the row.
+
+        Skips buildings where human_reviewed = 1 — the user has already looked
+        at this row and we don't want to re-bother them on later runs.
+
+        Returns number of flags written. Hallucinated ids are silently dropped.
         """
         valid_ids = {
             r["building_id"]
-            for r in self.conn.execute("SELECT building_id FROM buildings")
+            for r in self.conn.execute(
+                "SELECT building_id FROM buildings WHERE human_reviewed = 0"
+            )
         }
         n = 0
         for c in concerns:
@@ -314,7 +331,13 @@ class Store:
             if bid not in valid_ids:
                 continue
             possibly = c.get("possibly_same_as_id")
-            if possibly not in valid_ids:
+            # We allow possibly_same_as to point at *any* existing building,
+            # reviewed or not — that's just a pointer for the warning text.
+            existing = {
+                r["building_id"]
+                for r in self.conn.execute("SELECT building_id FROM buildings")
+            }
+            if possibly not in existing:
                 possibly = None
             self.conn.execute(
                 "UPDATE buildings SET flag=?, flag_reasoning=?, possibly_same_as_building_id=? "
@@ -325,13 +348,31 @@ class Store:
         self.conn.commit()
         return n
 
+    def dismiss_flag(self, building_id: int) -> None:
+        """User dismissed a flag without editing or merging — clear the warning
+        and mark the row as reviewed so future runs don't re-raise it.
+        """
+        self.conn.execute(
+            "UPDATE buildings SET flag=NULL, flag_reasoning=NULL, "
+            "possibly_same_as_building_id=NULL, human_reviewed=1 "
+            "WHERE building_id=?",
+            (building_id,),
+        )
+        self.conn.execute(
+            "INSERT INTO extraction_log (chunk_id,status,detail) VALUES (?,?,?)",
+            (-1, "manual_dismiss", f"building_id={building_id}"),
+        )
+        self.conn.commit()
+
     def update_canonical_address(self, building_id: int, canonical: str) -> None:
-        """User-edited canonical address. Clears the flag (user has reviewed)
-        and the coords (so geocode_pending will re-resolve with the new name).
+        """User-edited canonical address. Clears the flag (user has reviewed),
+        marks the row as human-reviewed (no auto re-flag on later runs), and
+        clears the coords (so geocode_pending will re-resolve with the new name).
         """
         self.conn.execute(
             "UPDATE buildings SET canonical_address=?, flag=NULL, flag_reasoning=NULL, "
-            "possibly_same_as_building_id=NULL, latitude=NULL, longitude=NULL, country=NULL "
+            "possibly_same_as_building_id=NULL, human_reviewed=1, "
+            "latitude=NULL, longitude=NULL, country=NULL "
             "WHERE building_id=?",
             (canonical, building_id),
         )
@@ -356,7 +397,7 @@ class Store:
         )
         self.conn.execute(
             "UPDATE buildings SET flag=NULL, flag_reasoning=NULL, "
-            "possibly_same_as_building_id=NULL WHERE building_id=?",
+            "possibly_same_as_building_id=NULL, human_reviewed=1 WHERE building_id=?",
             (survivor_id,),
         )
         self.conn.execute(
@@ -453,6 +494,102 @@ class Store:
             (chunk_id, status, detail),
         )
         self.conn.commit()
+
+    def delete_report(self, source_file: str) -> dict:
+        """Remove a report and every derived record.
+
+        Drops: observations, chunks (and their per-chunk extraction_log entries),
+        the document row, FAISS vectors, any building whose last observation was
+        in this report, and any building-level audit log entry (semantic_merge,
+        manual_edit, manual_merge with chunk_id=-1) that references one of the
+        deleted buildings. Returns counts. Idempotent.
+        """
+        import re
+
+        chunk_ids = [
+            r["chunk_id"]
+            for r in self.conn.execute(
+                "SELECT chunk_id FROM chunks WHERE source_file=?", (source_file,)
+            )
+        ]
+        n_obs = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM observations WHERE source_file=?", (source_file,)
+        ).fetchone()["n"]
+
+        # Predict which buildings will be orphaned (referenced only by this report)
+        will_orphan_bids = {
+            r["building_id"]
+            for r in self.conn.execute(
+                "SELECT building_id FROM observations WHERE source_file=? "
+                "  AND building_id IS NOT NULL "
+                "  AND building_id NOT IN ("
+                "    SELECT building_id FROM observations "
+                "    WHERE source_file != ? AND building_id IS NOT NULL"
+                "  )",
+                (source_file, source_file),
+            )
+        }
+
+        self.conn.execute("DELETE FROM observations WHERE source_file=?", (source_file,))
+        if chunk_ids:
+            placeholders = ",".join("?" * len(chunk_ids))
+            self.conn.execute(
+                f"DELETE FROM extraction_log WHERE chunk_id IN ({placeholders})",
+                chunk_ids,
+            )
+        self.conn.execute("DELETE FROM chunks WHERE source_file=?", (source_file,))
+        self.conn.execute("DELETE FROM documents WHERE source_file=?", (source_file,))
+
+        # Orphan buildings (rows now unreferenced).
+        n_buildings_deleted = self.conn.execute(
+            "DELETE FROM buildings WHERE building_id NOT IN ("
+            "  SELECT DISTINCT building_id FROM observations WHERE building_id IS NOT NULL"
+            ")"
+        ).rowcount
+
+        # Building-level audit entries (chunk_id=-1) reference building_ids in
+        # their `detail` string. Sweep any that touch a now-deleted building.
+        n_audit_cleaned = 0
+        if will_orphan_bids:
+            audit = self.conn.execute(
+                "SELECT log_id, detail FROM extraction_log WHERE chunk_id=-1"
+            ).fetchall()
+            stale = []
+            for r in audit:
+                d = r["detail"] or ""
+                referenced: set[int] = set()
+                for m in re.finditer(r"(?:building_id|survivor_id|merged_in)=(\d+)", d):
+                    referenced.add(int(m.group(1)))
+                for m in re.finditer(r"from_ids=\[([\d,\s]+)\]", d):
+                    referenced.update(
+                        int(x.strip()) for x in m.group(1).split(",") if x.strip()
+                    )
+                if referenced & will_orphan_bids:
+                    stale.append(r["log_id"])
+            if stale:
+                ph = ",".join("?" * len(stale))
+                self.conn.execute(
+                    f"DELETE FROM extraction_log WHERE log_id IN ({ph})", stale
+                )
+                n_audit_cleaned = len(stale)
+
+        self.conn.commit()
+
+        # FAISS vectors — IndexIDMap over IndexFlatIP supports remove_ids.
+        if chunk_ids:
+            ids = np.array(chunk_ids, dtype="int64")
+            try:
+                self.index.remove_ids(ids)
+                self.save_vectors()
+            except Exception:  # noqa: BLE001 — broken FAISS path is non-fatal
+                pass
+
+        return {
+            "observations": n_obs,
+            "chunks": len(chunk_ids),
+            "buildings_deleted": n_buildings_deleted,
+            "audit_cleaned": n_audit_cleaned,
+        }
 
     def add_vector(self, chunk_id: int, vector: np.ndarray) -> None:
         v = vector.astype("float32").reshape(1, -1)
