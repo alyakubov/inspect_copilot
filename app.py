@@ -41,7 +41,8 @@ if view == "Process":
             f"{stats['observations']} observations from {stats['chunks']} chunks · "
             f"OCR used: {stats['ocr_used']} · "
             f"geocoded: {stats['geocoded']} · "
-            f"buildings merged: {stats['buildings_merged']}"
+            f"buildings merged: {stats['buildings_merged']} · "
+            f"flagged for review: {stats['buildings_flagged']}"
         )
     log = store.sql("SELECT status, COUNT(*) n FROM extraction_log GROUP BY status")
     if log:
@@ -54,6 +55,7 @@ elif view == "Buildings":
         "SELECT b.building_id, "
         "       COALESCE(b.canonical_address, b.raw_address) AS display_name, "
         "       b.raw_address, b.canonical_address, "
+        "       b.flag, b.flag_reasoning, b.possibly_same_as_building_id, "
         "       b.latitude, b.longitude, b.country, "
         "       COUNT(o.obs_id) AS n_obs "
         "FROM buildings b LEFT JOIN observations o ON o.building_id = b.building_id "
@@ -62,15 +64,70 @@ elif view == "Buildings":
     if not buildings:
         st.info("No buildings yet — process a report first.")
     else:
-        options = {f"{b['display_name']}  ({b['n_obs']} defects)": b['building_id']
-                   for b in buildings}
+        # Flagged buildings get a leading ⚠️ in the dropdown so the user can see
+        # at a glance which ones the LLM wants reviewed.
+        options = {}
+        for b in buildings:
+            prefix = "⚠️ " if b['flag'] else ""
+            options[f"{prefix}{b['display_name']}  ({b['n_obs']} defects)"] = b['building_id']
         choice = st.selectbox("Select building", list(options.keys()))
         row = next(b for b in buildings if b['building_id'] == options[choice])
 
         st.subheader(row['display_name'])
-        # Show original extraction when LLM dedup renamed it (audit visibility)
         if row['canonical_address'] and row['canonical_address'] != row['raw_address']:
             st.caption(f"Originally extracted as: \"{row['raw_address']}\"")
+
+        # Surface the LLM's concern, if any
+        if row['flag']:
+            if row['flag'] == 'ambiguous_name':
+                st.warning(
+                    f"**⚠️ Ambiguous name** — {row['flag_reasoning']}\n\n"
+                    "The geocoded location is unreliable. Edit the canonical "
+                    "address with a specific city/state below and re-geocode."
+                )
+            elif row['flag'] == 'possible_duplicate':
+                sibling = next(
+                    (b for b in buildings if b['building_id'] == row['possibly_same_as_building_id']),
+                    None,
+                )
+                sibling_name = sibling['display_name'] if sibling else "(unknown)"
+                st.warning(
+                    f"**⚠️ Possible duplicate of \"{sibling_name}\"** — "
+                    f"{row['flag_reasoning']}\n\nIf they really are the same "
+                    "building, use **Merge into another building** below."
+                )
+
+        # Edit / merge panel — auto-opens for flagged buildings
+        with st.expander("Edit / merge this building", expanded=bool(row['flag'])):
+            new_canonical = st.text_input(
+                "Canonical address (saving re-geocodes)",
+                value=row['canonical_address'] or row['raw_address'],
+                key=f"edit_addr_{row['building_id']}",
+            )
+            if st.button("Save edit & re-geocode", key=f"save_edit_{row['building_id']}"):
+                store.update_canonical_address(row['building_id'], new_canonical)
+                with st.spinner("Re-geocoding…"):
+                    from inspect_copilot.geocode import geocode_pending
+                    geocode_pending(store)
+                st.success("Saved.")
+                st.rerun()
+
+            others = [b for b in buildings if b['building_id'] != row['building_id']]
+            if others:
+                st.markdown("---")
+                other_map = {f"{b['display_name']}  (id #{b['building_id']})": b['building_id']
+                             for b in others}
+                target_label = st.selectbox(
+                    "Merge into another building (this row will be deleted):",
+                    ["—"] + list(other_map.keys()),
+                    key=f"merge_target_{row['building_id']}",
+                )
+                if target_label != "—" and st.button(
+                    "Merge", key=f"merge_btn_{row['building_id']}"
+                ):
+                    store.manual_merge(other_map[target_label], row['building_id'])
+                    st.success("Merged.")
+                    st.rerun()
 
         if row['latitude'] is not None and row['longitude'] is not None:
             coord_str = f"📍 {row['latitude']:.5f}, {row['longitude']:.5f}"

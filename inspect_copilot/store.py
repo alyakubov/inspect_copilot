@@ -46,13 +46,16 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 
 CREATE TABLE IF NOT EXISTS buildings (
-    building_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    raw_address         TEXT,                -- as extracted from the report (audit)
-    normalized_address  TEXT UNIQUE,         -- for INSERT-time dedup
-    canonical_address   TEXT,                -- LLM-resolved official name+city (if set)
-    latitude            REAL,
-    longitude           REAL,
-    country             TEXT
+    building_id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_address                   TEXT,             -- as extracted from the report (audit)
+    normalized_address            TEXT UNIQUE,      -- for INSERT-time dedup
+    canonical_address             TEXT,             -- LLM-resolved official name+city (if set)
+    flag                          TEXT,             -- LLM concern: ambiguous_name | possible_duplicate
+    flag_reasoning                TEXT,             -- short LLM rationale shown in the UI
+    possibly_same_as_building_id  INTEGER REFERENCES buildings(building_id),  -- for possible_duplicate
+    latitude                      REAL,
+    longitude                     REAL,
+    country                       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS observations (
@@ -169,6 +172,15 @@ class Store:
         bcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(buildings)")}
         if "canonical_address" not in bcols:
             self.conn.execute("ALTER TABLE buildings ADD COLUMN canonical_address TEXT")
+        if "flag" not in bcols:
+            self.conn.execute("ALTER TABLE buildings ADD COLUMN flag TEXT")
+        if "flag_reasoning" not in bcols:
+            self.conn.execute("ALTER TABLE buildings ADD COLUMN flag_reasoning TEXT")
+        if "possibly_same_as_building_id" not in bcols:
+            self.conn.execute(
+                "ALTER TABLE buildings ADD COLUMN possibly_same_as_building_id "
+                "INTEGER REFERENCES buildings(building_id)"
+            )
 
     # ---- writes (ingestion side) ----
     def add_document(self, source_file: str, n_pages: int, ocr_used: bool, language: str) -> None:
@@ -285,6 +297,73 @@ class Store:
             n_merged += len(dupes)
         self.conn.commit()
         return n_merged
+
+    def apply_concerns(self, concerns: list[dict]) -> int:
+        """Record LLM-flagged concerns about extracted buildings (ambiguous names,
+        possible duplicates the LLM lacked evidence to merge). Each concern sets
+        flag / flag_reasoning / possibly_same_as_building_id on the row. Returns
+        number of flags written. Hallucinated ids are silently dropped.
+        """
+        valid_ids = {
+            r["building_id"]
+            for r in self.conn.execute("SELECT building_id FROM buildings")
+        }
+        n = 0
+        for c in concerns:
+            bid = c.get("building_id")
+            if bid not in valid_ids:
+                continue
+            possibly = c.get("possibly_same_as_id")
+            if possibly not in valid_ids:
+                possibly = None
+            self.conn.execute(
+                "UPDATE buildings SET flag=?, flag_reasoning=?, possibly_same_as_building_id=? "
+                "WHERE building_id=?",
+                (c.get("concern"), c.get("reasoning"), possibly, bid),
+            )
+            n += 1
+        self.conn.commit()
+        return n
+
+    def update_canonical_address(self, building_id: int, canonical: str) -> None:
+        """User-edited canonical address. Clears the flag (user has reviewed)
+        and the coords (so geocode_pending will re-resolve with the new name).
+        """
+        self.conn.execute(
+            "UPDATE buildings SET canonical_address=?, flag=NULL, flag_reasoning=NULL, "
+            "possibly_same_as_building_id=NULL, latitude=NULL, longitude=NULL, country=NULL "
+            "WHERE building_id=?",
+            (canonical, building_id),
+        )
+        self.conn.execute(
+            "INSERT INTO extraction_log (chunk_id,status,detail) VALUES (?,?,?)",
+            (-1, "manual_edit",
+             f"building_id={building_id} canonical={canonical!r}"),
+        )
+        self.conn.commit()
+
+    def manual_merge(self, survivor_id: int, dupe_id: int) -> None:
+        """User-initiated merge of dupe into survivor. Repoints observations,
+        deletes the dupe row, clears any flag on the survivor (user has
+        reviewed), and logs the action in extraction_log.
+        """
+        self.conn.execute(
+            "UPDATE observations SET building_id=? WHERE building_id=?",
+            (survivor_id, dupe_id),
+        )
+        self.conn.execute(
+            "DELETE FROM buildings WHERE building_id=?", (dupe_id,),
+        )
+        self.conn.execute(
+            "UPDATE buildings SET flag=NULL, flag_reasoning=NULL, "
+            "possibly_same_as_building_id=NULL WHERE building_id=?",
+            (survivor_id,),
+        )
+        self.conn.execute(
+            "INSERT INTO extraction_log (chunk_id,status,detail) VALUES (?,?,?)",
+            (-1, "manual_merge", f"survivor_id={survivor_id} merged_in={dupe_id}"),
+        )
+        self.conn.commit()
 
     def merge_similar_named_buildings(self) -> int:
         """Merge buildings whose extracted names look like the same place under

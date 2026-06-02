@@ -68,7 +68,7 @@ def process_pdf(pdf_path: str | Path, store: Store) -> dict:
     #      the same lat/lon.
     #   4. name-based merge — string-similarity safety net.
     # All best-effort; none can fail the pipeline.
-    merged_by_llm = semantic_dedupe(store)
+    sem = semantic_dedupe(store)
     geo = geocode_pending(store)
     merged_by_coord = store.merge_duplicate_buildings()
     merged_by_name = store.merge_similar_named_buildings()
@@ -79,7 +79,8 @@ def process_pdf(pdf_path: str | Path, store: Store) -> dict:
         "ocr_used": ocr_used,
         "observations": n_obs,
         "geocoded": f"{geo['resolved']}/{geo['attempted']}",
-        "buildings_merged": merged_by_llm + merged_by_coord + merged_by_name,
+        "buildings_merged": sem["merged"] + merged_by_coord + merged_by_name,
+        "buildings_flagged": sem["concerns"],
     }
 
 
