@@ -66,8 +66,12 @@ ingest (text layer + OCR fallback) → chunk + language-detect
   storage layer (`store.py`) is a thin interface, so migrating to pgvector at
   portfolio scale means rewriting one file. Trade-off: no concurrent writers,
   no ANN index — both irrelevant at this scale.
-- **Streamlit, not React.** This is an internal inspector tool; speed-to-usable
-  beats frontend polish. Production rebuild would be React (SECO's stack).
+- **React + FastAPI (migrated from Streamlit).** The UI is a React/TypeScript
+  SPA (Vite + MUI) talking to a thin FastAPI wrapper around the same engine.
+  Streamlit got to usable fastest; the React frontend is the production-shaped
+  rebuild on SECO's stack. The engine (extraction, SQL, FAISS, geocoding,
+  dedup) is unchanged — FastAPI just exposes it over JSON. The old `app.py`
+  Streamlit UI is retained for reference but is no longer the entry point.
 - **Controlled vocabulary in the schema.** Enums make aggregation meaningful
   but lose nuance; free-text fields (`recommended_action`, `location`) keep it.
 - **Validation quarantine, not silent drops.** Failed extractions go to
@@ -97,45 +101,56 @@ pgvector; cross-report portfolio risk patterns.
 
 ## Run
 
-Initiation:
-```bash
-  # 1. Create the parent directory (one-time)                                                                                                                                                                 
-mkdir -p ~/.venvs                                                                  
-                                                                                                                                                                                                              
-  # 2. Create the venv using system Python 3.11                                                             
-python3 -m venv ~/.venvs/inspect_copilot                                                                                                                                                                    
-                                                                                                                                                                                                              
-  # 3. Activate it                                                                                 
-source ~/.venvs/inspect_copilot/bin/activate                                                                                                                                                                
-                                                                                                                                                     
-  # 4. Verify you're in the right env — should print ~/.venvs/inspect_copilot/bin/python                                                                                                                      
-which python                                                                       
-python --version                                                                                                                                                                                            
-                                                                                                                                                     
-  # 5. Upgrade packaging tools inside the new venv                                                                                                                                                            
-pip install --upgrade pip setuptools wheel                                         
-                                                                                                                                                                                                              
-  # 6. Go to the project and install requirements                                                                                                                                                             
-  # cd inspect_copilot  -- go to the project folder if you are not there                                        
-pip install -r requirements.txt  
+The app is a **FastAPI** backend (`api/`) serving a **React/Vite** frontend
+(`frontend/`). Both sit on top of the unchanged `inspect_copilot/` engine.
 
-  # 5. Install tesseract for OCR processing 
-  # add tesseract-ocr-fra tesseract-ocr-nld if needed
-sudo apt-get update                                                                               
-sudo apt-get install tesseract-ocr tesseract-ocr-eng                                                                                                                        
-```
-
-To run the app:
+### 1. Backend (Python 3.11 venv)
 ```bash
+mkdir -p ~/.venvs
+python3 -m venv ~/.venvs/inspect_copilot
 source ~/.venvs/inspect_copilot/bin/activate
-export ANTHROPIC_API_KEY=...
-streamlit run app.py
+pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+
+# OCR (scanned pages); add tesseract-ocr-fra tesseract-ocr-nld if needed
+sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
 ```
 
-Optional convenience — auto-activate alias                                                                                                                                                                  
-                                                                                                   
-  Add to ~/.bashrc:
+### 2. Frontend (Node 20, pinned via .nvmrc)
+```bash
+nvm install      # reads .nvmrc -> Node 20
+nvm use
+cd frontend && npm install && cd ..
+```
 
-  alias seco='source ~/.venvs/inspect_copilot/bin/activate && cd ~/your/path/to/inspect_copilot' 
+### 3. Configure
+Copy `.env.example` to `.env` and fill in `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`
+(and optionally `CESIUM_ION_TOKEN`, `USER_LOGIN`/`USER_PASSWORD`, `NO_DELETE_REPORT`).
 
-  Then just type seco to jump in.
+### Develop (two terminals, hot reload)
+```bash
+# terminal 1 — API on :8001  (8000 is Django's default; avoid the clash)
+source ~/.venvs/inspect_copilot/bin/activate
+uvicorn api.main:app --reload --port 8001
+
+# terminal 2 — SPA on :5173 (proxies /api -> :8001)
+cd frontend && npm run dev
+# open http://localhost:5173
+```
+
+### Production (single process)
+```bash
+cd frontend && npm run build && cd ..   # emits frontend/dist
+source ~/.venvs/inspect_copilot/bin/activate
+uvicorn api.main:app --port 8001        # serves the SPA + API at http://localhost:8001
+```
+
+**Optional env flags**
+- `USER_LOGIN` + `USER_PASSWORD` — if both set, the UI requires login; if either
+  is absent, no login is required.
+- `NO_DELETE_REPORT=true` — the report Delete button stays visible but deletion
+  is blocked.
+- A processed report can't be re-uploaded until it's deleted (HTTP 409).
+
+> Legacy: the original Streamlit UI still runs via `streamlit run app.py`, but
+> the React frontend above is the supported entry point.

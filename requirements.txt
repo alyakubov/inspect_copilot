@@ -6,9 +6,18 @@ langdetect>=1.0.9
 pydantic>=2.7
 faiss-cpu>=1.8
 sentence-transformers>=3.0
-streamlit>=1.36
 pandas>=2.2
 python-dotenv>=1.0
 geopy>=2.4
+
+# --- React frontend backend (FastAPI) ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+itsdangerous>=2.2
+
+# --- legacy Streamlit UI (superseded by the React frontend + FastAPI API;
+# kept installable for reference, no longer the primary entry point) ---
+streamlit>=1.36
 folium>=0.17
 streamlit-folium>=0.20
