@@ -1,5 +1,4 @@
 """InspectCopilot — minimal Streamlit UI.
-
 Four views, each mapping to a piece of the design:
   Process   -> run the dual-index pipeline, show the extraction log (robustness evidence)
   Browse    -> filterable observation table with verbatim-quote traceability (SQL)
@@ -53,7 +52,7 @@ if view == "Process":
             f"buildings merged: {stats['buildings_merged']} · "
             f"flagged for review: {stats['buildings_flagged']}"
         )
-    log = store.sql("SELECT status, COUNT(*) n FROM extraction_log GROUP BY status")
+    log = store.sql("SELECT status, COUNT(*) stats FROM extraction_log GROUP BY status")
     if log:
         st.subheader("Extraction log")
         st.table(pd.DataFrame([dict(r) for r in log]))
@@ -68,13 +67,23 @@ if view == "Process":
         st.caption("No reports yet.")
     else:
         for d in docs:
-            cols = st.columns([1, 6, 3, 2])
+            cols = st.columns([1, 5, 3, 2, 2])
             cols[0].markdown(f"**#{d['report_id']}**")
             cols[1].write(d['source_file'])
             cols[2].caption(f"{d['n_pages']} pages · {d['n_obs']} obs")
-            if cols[3].button("🗑 Delete", key=f"del_report_{d['report_id']}"):
+            pdf_path = Path("data/raw") / d['source_file']
+            if pdf_path.exists():
+                cols[3].download_button(
+                    "⬇ Download",
+                    data=pdf_path.read_bytes(),
+                    file_name=d['source_file'],
+                    mime="application/pdf",
+                    key=f"dl_report_{d['report_id']}",
+                )
+            else:
+                cols[3].caption("file missing")
+            if cols[4].button("🗑 Delete", key=f"del_report_{d['report_id']}"):
                 stats = store.delete_report(d['source_file'])
-                pdf_path = Path("data/raw") / d['source_file']
                 if pdf_path.exists():
                     pdf_path.unlink()
                 st.toast(
@@ -378,7 +387,6 @@ elif view == "Ask":
     # example first so users discover that ordinal references work.
     examples = [
         "What is the most serious defect in report 1?",
-        "Which reports mention chloride-induced corrosion?",
         "Summarize the ventilation problems in the child care center.",
     ]
     st.caption("Examples (click to use):")

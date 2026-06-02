@@ -26,13 +26,11 @@ from .store import Store
 
 _log = logging.getLogger(__name__)
 
-# A merge group is REJECTED when two or more of its members independently
-# geocode to points farther apart than this. The LLM's world knowledge is a
-# guess; an address that resolves a kilometre away is hard evidence the guess
-# is wrong. 250 m comfortably covers a single large federal complex while still
-# catching cross-town hallucinations (e.g. the GSA Headquarters Building at
-# 1800 F St NW vs the William Jefferson Clinton Federal Building at the Federal
-# Triangle, ~1 km apart, which an earlier run wrongly merged).
+# Two member references are treated as the same physical building only when
+# they geocode within this distance of each other. 250 m comfortably covers a
+# single large federal complex while still separating buildings a few blocks
+# apart (e.g. the GSA Headquarters Building at 1800 F St NW vs the William
+# Jefferson Clinton Federal Building at the Federal Triangle, ~1 km apart).
 _MERGE_MAX_SPREAD_M = 250.0
 
 
@@ -46,40 +44,68 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
 
-def _geo_consistent(store: Store, alias_ids: list[int]) -> bool:
-    """True unless there is positive geographic evidence the members differ.
+def _anchor_region(canonical_address: str) -> str:
+    """Pull a 'City, ST' tail from the LLM's canonical address.
 
-    For each member we use its stored coords if known, else geocode its
-    raw_address independently. We REJECT (return False) only when at least two
-    members resolve and the farthest pair exceeds _MERGE_MAX_SPREAD_M. When
-    fewer than two members geocode we cannot disprove the merge, so we allow it
-    — this preserves function-alias merges where one name doesn't geocode
-    (e.g. 'Bankruptcy Courthouse' for the Garmatz courthouse).
+    Used to anchor ambiguous member-name geocoding to the intended place:
+    bare 'Clinton Building' geocodes to Los Angeles, but 'Clinton Building,
+    Washington, DC' resolves correctly. Returns '' when no region is present.
+    """
+    parts = [p.strip() for p in (canonical_address or "").split(",") if p.strip()]
+    if len(parts) >= 2:
+        return ", ".join(parts[-2:])
+    return parts[-1] if parts else ""
+
+
+def _confirm_merge_members(
+    store: Store, alias_ids: list[int], canonical_address: str
+) -> list[int]:
+    """Return the subset of members whose locations positively agree.
+
+    Confirm-only verification: a merge is trusted only where geography backs it
+    up. Each member is geocoded with the canonical address's region appended
+    (so an ambiguous name resolves in the right city rather than wherever it is
+    most common). We then keep the LARGEST cluster of members lying within
+    _MERGE_MAX_SPREAD_M of one another; members we can't place, or that sit
+    apart from the cluster, are dropped. Returns [] when fewer than two members
+    agree — i.e. there's nothing we can confidently merge.
+
+    This is deliberately conservative: an un-geocodable reference (a bare
+    'GSA Headquarters Building', a 'Child Care Center', a 'Wing 0') is left as
+    its own building rather than risk attaching it to the wrong host. Stored
+    coords are reused when present to avoid redundant lookups.
     """
     if len(alias_ids) < 2:
-        return True
+        return []
+    region = _anchor_region(canonical_address)
     placeholders = ",".join("?" * len(alias_ids))
     rows = store.sql(
         f"SELECT building_id, raw_address, latitude, longitude "
         f"FROM buildings WHERE building_id IN ({placeholders})",
         tuple(alias_ids),
     )
-    coords: list[tuple[float, float]] = []
+    located: list[tuple[int, float, float]] = []
     for r in rows:
         if r["latitude"] is not None and r["longitude"] is not None:
-            coords.append((r["latitude"], r["longitude"]))
+            located.append((r["building_id"], r["latitude"], r["longitude"]))
             continue
-        geo = geocode_address(r["raw_address"])
+        addr = r["raw_address"] or ""
+        if region and region.lower() not in addr.lower():
+            addr = f"{addr}, {region}"
+        geo = geocode_address(addr)
         if geo is not None:
-            coords.append((geo[0], geo[1]))
-    if len(coords) < 2:
-        return True
-    spread = max(
-        _haversine_m(*coords[i], *coords[j])
-        for i in range(len(coords))
-        for j in range(i + 1, len(coords))
-    )
-    return spread <= _MERGE_MAX_SPREAD_M
+            located.append((r["building_id"], geo[0], geo[1]))
+    if len(located) < 2:
+        return []
+    best: list[int] = []
+    for _, slat, slon in located:
+        cluster = [
+            bid for bid, lat, lon in located
+            if _haversine_m(slat, slon, lat, lon) <= _MERGE_MAX_SPREAD_M
+        ]
+        if len(cluster) > len(best):
+            best = cluster
+    return best if len(best) >= 2 else []
 
 _CLIENT = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 _MODEL = os.environ.get("ANTHROPIC_MODEL")
@@ -167,18 +193,28 @@ def semantic_dedupe(store: Store) -> dict:
         _log.warning("semantic dedup LLM call failed: %s", e)
         return {"merged": 0, "concerns": 0}
 
-    # Geographic verification: drop any LLM merge whose members independently
-    # geocode far apart. Catches same-named-organisation hallucinations the
-    # prompt can't be trusted to avoid. Rejections are logged, never silent.
+    # Confirm-only geographic verification: apply a merge only for the subset of
+    # members whose locations positively agree (see _confirm_merge_members).
+    # An LLM guess is trusted only where geography backs it up — catching
+    # same-named-building hallucinations the prompt can't be relied on to avoid.
+    # Dropped groups and trimmed members are logged, never silent.
     proposed = data.get("merges") or []
     verified = []
     for grp in proposed:
-        if _geo_consistent(store, grp.get("alias_ids") or []):
-            verified.append(grp)
+        alias_ids = grp.get("alias_ids") or []
+        confirmed = _confirm_merge_members(store, alias_ids, grp.get("canonical_address") or "")
+        if len(confirmed) >= 2:
+            if set(confirmed) != set(alias_ids):
+                store.log(
+                    -1, "merge_trimmed_geo",
+                    f"applied subset {confirmed} of proposed {alias_ids} "
+                    f"canonical={grp.get('canonical_address')!r}",
+                )
+            verified.append({**grp, "alias_ids": confirmed})
         else:
             store.log(
                 -1, "merge_rejected_geo",
-                f"alias_ids={grp.get('alias_ids')} canonical={grp.get('canonical_address')!r} "
+                f"alias_ids={alias_ids} canonical={grp.get('canonical_address')!r} "
                 f"reasoning={grp.get('reasoning','')!r}",
             )
 

@@ -3,8 +3,9 @@
 1. ingest._strip_boilerplate — publisher contact-block addresses (e.g. the OIG
    letterhead '1800 F Street NW') never reach extraction, while a genuine
    building address in body prose survives.
-2. dedupe._geo_consistent — an LLM merge whose members geocode far apart is
-   rejected; close or unverifiable groups are allowed.
+2. dedupe._confirm_merge_members — region-anchored confirm-only: a merge is
+   applied only for the subset of members that geocode into one ~250m cluster;
+   un-geocodable members are dropped and unconfirmed groups are skipped.
 """
 import os
 
@@ -53,7 +54,20 @@ def test_strip_removes_running_footer_across_pages():
         assert f"Body finding {i}" in out[i]
 
 
-# --- geocode-verified merge guard ------------------------------------------
+# --- geocode-verified merge guard (region-anchored, confirm-only) ----------
+
+def _fake_geo(addr: str):
+    """Stand-in for Nominatim. Mimics the real failure modes we measured:
+    'Garmatz'/'Clinton' resolve (to Baltimore / DC), everything else — bare
+    'GSA Headquarters Building', 'Child Care Center', 'Wing 0' — is unresolvable.
+    """
+    a = addr.lower()
+    if "garmatz" in a:
+        return (39.2871, -76.6174, "US")   # Baltimore
+    if "clinton" in a:
+        return (38.8940, -77.0288, "US")   # DC, Federal Triangle
+    return None
+
 
 def test_haversine_dc_buildings_about_1km():
     # GSA HQ (1800 F St NW) vs Clinton Federal Building (Federal Triangle)
@@ -61,54 +75,73 @@ def test_haversine_dc_buildings_about_1km():
     assert 1000 < d < 1400
 
 
-def test_guard_rejects_members_far_apart(tmp_path, monkeypatch):
+def test_anchor_region():
+    assert dedupe._anchor_region("Edward A. Garmatz Federal Courthouse, Baltimore, MD") == "Baltimore, MD"
+    assert dedupe._anchor_region("") == ""
+
+
+def test_confirms_building_with_its_own_alias(tmp_path, monkeypatch):
+    # 'Clinton Building' is anchored to DC and resolves to the same spot as the
+    # full name -> both confirmed and merged.
     store = _store(tmp_path)
-    a = store.get_or_create_building("GSA Headquarters Building")
-    b = store.get_or_create_building("William Jefferson Clinton Federal Building")
-    coords = {
-        "GSA Headquarters Building": (38.8970, -77.0426, "US"),
-        "William Jefferson Clinton Federal Building": (38.8940, -77.0288, "US"),
-    }
-    monkeypatch.setattr(dedupe, "geocode_address", lambda addr: coords.get(addr))
-    assert dedupe._geo_consistent(store, [a, b]) is False
+    a = store.get_or_create_building("William Jefferson Clinton Federal Building, Washington, DC")
+    b = store.get_or_create_building("Clinton Building")
+    monkeypatch.setattr(dedupe, "geocode_address", _fake_geo)
+    confirmed = dedupe._confirm_merge_members(
+        store, [a, b], "William Jefferson Clinton Federal Building, Washington, DC")
+    assert set(confirmed) == {a, b}
 
 
-def test_guard_allows_members_same_place(tmp_path, monkeypatch):
+def test_drops_ungeocodable_member_no_merge(tmp_path, monkeypatch):
+    # The actual bug: GSA HQ won't geocode, so it can't be confirmed at Clinton's
+    # location -> fewer than two confirm -> nothing merges.
     store = _store(tmp_path)
-    a = store.get_or_create_building("Garmatz Courthouse")
-    b = store.get_or_create_building("Edward A. Garmatz Federal Courthouse")
-    monkeypatch.setattr(dedupe, "geocode_address", lambda addr: (39.2871, -76.6174, "US"))
-    assert dedupe._geo_consistent(store, [a, b]) is True
+    a = store.get_or_create_building("William Jefferson Clinton Federal Building, Washington, DC")
+    gsa = store.get_or_create_building("GSA Headquarters Building")
+    monkeypatch.setattr(dedupe, "geocode_address", _fake_geo)
+    assert dedupe._confirm_merge_members(
+        store, [a, gsa], "William Jefferson Clinton Federal Building, Washington, DC") == []
 
 
-def test_guard_allows_when_only_one_member_geocodes(tmp_path, monkeypatch):
-    # function-alias case: 'Bankruptcy Courthouse' won't geocode on its own,
-    # so there is no positive evidence to block the merge.
+def test_partial_keeps_only_confirmed_cluster(tmp_path, monkeypatch):
+    # Mixed group: the two Clinton refs confirm; the un-geocodable GSA HQ ref is
+    # dropped from the merge.
     store = _store(tmp_path)
-    a = store.get_or_create_building("Garmatz Courthouse")
-    b = store.get_or_create_building("Bankruptcy Courthouse")
-    monkeypatch.setattr(
-        dedupe, "geocode_address",
-        lambda addr: (39.2871, -76.6174, "US") if "Garmatz" in addr else None,
-    )
-    assert dedupe._geo_consistent(store, [a, b]) is True
+    a = store.get_or_create_building("William Jefferson Clinton Federal Building, Washington, DC")
+    b = store.get_or_create_building("Clinton Building")
+    gsa = store.get_or_create_building("GSA Headquarters Building")
+    monkeypatch.setattr(dedupe, "geocode_address", _fake_geo)
+    confirmed = dedupe._confirm_merge_members(
+        store, [a, b, gsa], "William Jefferson Clinton Federal Building, Washington, DC")
+    assert set(confirmed) == {a, b}
 
 
-def test_guard_uses_stored_coords_without_geocoding(tmp_path, monkeypatch):
+def test_rejects_two_different_buildings(tmp_path, monkeypatch):
+    # Even if the LLM proposes it, a DC building and a Baltimore building never
+    # cluster -> no confirmed pair.
+    store = _store(tmp_path)
+    a = store.get_or_create_building("Clinton Building")
+    b = store.get_or_create_building("Garmatz Courthouse")
+    monkeypatch.setattr(dedupe, "geocode_address", _fake_geo)
+    assert dedupe._confirm_merge_members(
+        store, [a, b], "William Jefferson Clinton Federal Building, Washington, DC") == []
+
+
+def test_confirm_uses_stored_coords_without_geocoding(tmp_path, monkeypatch):
     store = _store(tmp_path)
     a = store.get_or_create_building("Building A")
     b = store.get_or_create_building("Building B")
-    store.update_building_coords(a, 40.0000, -75.0000, "US")
-    store.update_building_coords(b, 40.0500, -75.0000, "US")  # ~5.5 km away
+    store.update_building_coords(a, 40.00000, -75.0, "US")
+    store.update_building_coords(b, 40.00100, -75.0, "US")  # ~111 m apart -> same cluster
 
     def _boom(addr):
         raise AssertionError("should not geocode when coords are stored")
 
     monkeypatch.setattr(dedupe, "geocode_address", _boom)
-    assert dedupe._geo_consistent(store, [a, b]) is False
+    assert set(dedupe._confirm_merge_members(store, [a, b], "X, City, ST")) == {a, b}
 
 
-def test_guard_allows_single_member_group(tmp_path):
+def test_confirm_single_member_group_returns_empty(tmp_path):
     store = _store(tmp_path)
     a = store.get_or_create_building("Lone Building")
-    assert dedupe._geo_consistent(store, [a]) is True
+    assert dedupe._confirm_merge_members(store, [a], "Lone Building, City, ST") == []
