@@ -21,6 +21,8 @@ from pydantic import ValidationError
 
 from .ingest import ingest
 from .extract import extract
+from .dedupe import semantic_dedupe
+from .geocode import geocode_pending
 from .store import Store
 
 _EMBEDDER = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")  # 384-dim, free, local
@@ -56,7 +58,29 @@ def process_pdf(pdf_path: str | Path, store: Store) -> dict:
             store.log(chunk_id, "llm_error", str(e)[:500])
 
     store.save_vectors()
-    return {"file": pdf_path.name, "chunks": len(chunks), "ocr_used": ocr_used, "observations": n_obs}
+
+    # Three dedup passes + geocoding, in order of how much context each can use:
+    #   1. semantic dedup (LLM) — collapses same-building references that differ
+    #      arbitrarily (e.g. 'Garmatz Courthouse' + 'Bankruptcy Courthouse'); uses
+    #      world knowledge of US public buildings and writes a canonical_address.
+    #   2. geocode — runs on canonical_address when set, raw_address otherwise.
+    #   3. coord-based merge — for buildings the LLM missed but that geocoded to
+    #      the same lat/lon.
+    #   4. name-based merge — string-similarity safety net.
+    # All best-effort; none can fail the pipeline.
+    merged_by_llm = semantic_dedupe(store)
+    geo = geocode_pending(store)
+    merged_by_coord = store.merge_duplicate_buildings()
+    merged_by_name = store.merge_similar_named_buildings()
+
+    return {
+        "file": pdf_path.name,
+        "chunks": len(chunks),
+        "ocr_used": ocr_used,
+        "observations": n_obs,
+        "geocoded": f"{geo['resolved']}/{geo['attempted']}",
+        "buildings_merged": merged_by_llm + merged_by_coord + merged_by_name,
+    }
 
 
 def process_folder(folder: str | Path, store: Store) -> list[dict]:

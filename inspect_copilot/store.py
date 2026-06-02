@@ -47,8 +47,9 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 CREATE TABLE IF NOT EXISTS buildings (
     building_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    raw_address         TEXT,
-    normalized_address  TEXT UNIQUE,
+    raw_address         TEXT,                -- as extracted from the report (audit)
+    normalized_address  TEXT UNIQUE,         -- for INSERT-time dedup
+    canonical_address   TEXT,                -- LLM-resolved official name+city (if set)
     latitude            REAL,
     longitude           REAL,
     country             TEXT
@@ -85,6 +86,63 @@ def _normalize_address(s: str) -> str:
     return " ".join(s.lower().strip().split()).rstrip(".,;:")
 
 
+def _name_tokens(s: str) -> list[str]:
+    import re
+    cleaned = re.sub(r"[^\w\s]", " ", s.lower())
+    return [t for t in cleaned.split() if len(t) > 1]
+
+
+# Building-type suffixes that don't identify *which* building.
+# Stripping them stops "Federal Building" from collapsing into every other
+# "X Federal Building" purely on the shared generic words.
+_GENERIC_BUILDING_WORDS = frozenset({
+    "building", "buildings", "courthouse", "courthouses", "center", "centre",
+    "complex", "facility", "facilities", "hall", "station", "office",
+    "headquarters", "annex", "tower", "plaza", "post", "court", "federal",
+})
+
+
+def _names_likely_same_building(a: str, b: str) -> bool:
+    """Heuristic for two extracted names referring to the same building.
+
+    Catches:
+    1. Containment — shorter name's distinctive tokens fully appear in longer.
+       'Clinton Building' vs 'William Jefferson Clinton Federal Building'.
+    2. Acronym expansion — uppercase token in one spells initials of consecutive
+       words in the other. 'Oroville LPOE' vs 'Oroville Land Port of Entry'.
+
+    Refuses to merge when both sides are all generic terms.
+    """
+    import re
+    tok_a = _name_tokens(a)
+    tok_b = _name_tokens(b)
+    if not tok_a or not tok_b:
+        return False
+
+    distinctive_a = set(tok_a) - _GENERIC_BUILDING_WORDS
+    distinctive_b = set(tok_b) - _GENERIC_BUILDING_WORDS
+    if not distinctive_a or not distinctive_b:
+        return False
+
+    shorter, longer = (
+        (distinctive_a, distinctive_b)
+        if len(distinctive_a) <= len(distinctive_b)
+        else (distinctive_b, distinctive_a)
+    )
+    if shorter.issubset(longer):
+        return True
+
+    def _matches_via_acronym(src: str, target_tokens: list[str]) -> bool:
+        for acronym in re.findall(r"\b[A-Z]{2,5}\b", src):
+            n = len(acronym)
+            for i in range(len(target_tokens) - n + 1):
+                if all(target_tokens[i + j][:1] == acronym[j].lower() for j in range(n)):
+                    return True
+        return False
+
+    return _matches_via_acronym(a, tok_b) or _matches_via_acronym(b, tok_a)
+
+
 class Store:
     def __init__(self, db_path: str | Path, faiss_path: str | Path, dim: int = 384):
         self.db_path = str(db_path)
@@ -108,6 +166,9 @@ class Store:
             self.conn.execute(
                 "ALTER TABLE observations ADD COLUMN building_id INTEGER REFERENCES buildings(building_id)"
             )
+        bcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(buildings)")}
+        if "canonical_address" not in bcols:
+            self.conn.execute("ALTER TABLE buildings ADD COLUMN canonical_address TEXT")
 
     # ---- writes (ingestion side) ----
     def add_document(self, source_file: str, n_pages: int, ocr_used: bool, language: str) -> None:
@@ -124,6 +185,146 @@ class Store:
         )
         self.conn.commit()
         return cur.lastrowid
+
+    def update_building_coords(
+        self,
+        building_id: int,
+        latitude: float,
+        longitude: float,
+        country: str | None,
+    ) -> None:
+        self.conn.execute(
+            "UPDATE buildings SET latitude=?, longitude=?, country=? WHERE building_id=?",
+            (latitude, longitude, country, building_id),
+        )
+        self.conn.commit()
+
+    def merge_duplicate_buildings(self, eps_deg: float = 0.0005) -> int:
+        """Merge buildings whose geocoded coords fall within `eps_deg` of each
+        other (default ~55m at the equator). Survivor is the row with the
+        lowest building_id; observations are repointed at the survivor and
+        duplicate building rows are deleted. Returns count of merged-away rows.
+        Idempotent — running again on a clean DB returns 0.
+        """
+        from collections import defaultdict
+
+        rows = self.conn.execute(
+            "SELECT building_id, latitude, longitude FROM buildings "
+            "WHERE latitude IS NOT NULL AND longitude IS NOT NULL"
+        ).fetchall()
+
+        clusters: dict[tuple[float, float], list[int]] = defaultdict(list)
+        for r in rows:
+            key = (
+                round(r["latitude"] / eps_deg) * eps_deg,
+                round(r["longitude"] / eps_deg) * eps_deg,
+            )
+            clusters[key].append(r["building_id"])
+
+        n_merged = 0
+        for ids in clusters.values():
+            if len(ids) < 2:
+                continue
+            survivor = min(ids)
+            dupes = [i for i in ids if i != survivor]
+            self.conn.executemany(
+                "UPDATE observations SET building_id=? WHERE building_id=?",
+                [(survivor, d) for d in dupes],
+            )
+            self.conn.executemany(
+                "DELETE FROM buildings WHERE building_id=?",
+                [(d,) for d in dupes],
+            )
+            n_merged += len(dupes)
+        self.conn.commit()
+        return n_merged
+
+    def apply_canonical_merges(self, merges: list[dict]) -> int:
+        """Apply LLM-suggested same-building merges.
+
+        Each merge group is {canonical_address, alias_ids, reasoning?}. Survivor
+        is the lowest alias_id; its canonical_address is set, lat/lon cleared
+        (so geocoding re-runs on the better name), observations from other ids
+        are repointed at the survivor, dupe rows deleted. Each merge is logged
+        in extraction_log with the LLM's reasoning for audit.
+
+        Hallucinated ids (not in the DB) are silently dropped. Groups with
+        fewer than 2 valid ids are skipped. Returns count of merged-away rows.
+        """
+        valid_ids = {
+            r["building_id"]
+            for r in self.conn.execute("SELECT building_id FROM buildings")
+        }
+        n_merged = 0
+        for grp in merges:
+            canonical = (grp.get("canonical_address") or "").strip()
+            ids = [i for i in grp.get("alias_ids") or [] if i in valid_ids]
+            if len(ids) < 2 or not canonical:
+                continue
+            survivor = min(ids)
+            dupes = [i for i in ids if i != survivor]
+            self.conn.execute(
+                "UPDATE buildings SET canonical_address=?, latitude=NULL, longitude=NULL, country=NULL "
+                "WHERE building_id=?",
+                (canonical, survivor),
+            )
+            self.conn.executemany(
+                "UPDATE observations SET building_id=? WHERE building_id=?",
+                [(survivor, d) for d in dupes],
+            )
+            self.conn.executemany(
+                "DELETE FROM buildings WHERE building_id=?",
+                [(d,) for d in dupes],
+            )
+            self.conn.execute(
+                "INSERT INTO extraction_log (chunk_id,status,detail) VALUES (?,?,?)",
+                (-1, "semantic_merge",
+                 f"canonical={canonical!r} survivor_id={survivor} from_ids={ids}"
+                 f" reasoning={grp.get('reasoning','')!r}"),
+            )
+            n_merged += len(dupes)
+        self.conn.commit()
+        return n_merged
+
+    def merge_similar_named_buildings(self) -> int:
+        """Merge buildings whose extracted names look like the same place under
+        a shorter or abbreviated form (see _names_likely_same_building).
+
+        Survivor: the longer name (more specific). Survivor's coords are kept as-is —
+        the shorter-named row's coords are discarded because the shorter name is
+        more likely to have been geocoded to the wrong place.
+
+        Idempotent — running again on a clean DB returns 0.
+        """
+        rows = self.conn.execute(
+            "SELECT building_id, raw_address FROM buildings "
+            "ORDER BY length(raw_address) DESC, building_id"
+        ).fetchall()
+
+        survivors: list[tuple[int, str]] = []
+        merges: list[tuple[int, int]] = []  # (survivor_id, dupe_id)
+        for r in rows:
+            bid, addr = r["building_id"], r["raw_address"]
+            match_id = next(
+                (s_id for s_id, s_addr in survivors if _names_likely_same_building(addr, s_addr)),
+                None,
+            )
+            if match_id is None:
+                survivors.append((bid, addr))
+            else:
+                merges.append((match_id, bid))
+
+        for survivor_id, dupe_id in merges:
+            self.conn.execute(
+                "UPDATE observations SET building_id=? WHERE building_id=?",
+                (survivor_id, dupe_id),
+            )
+            self.conn.execute(
+                "DELETE FROM buildings WHERE building_id=?",
+                (dupe_id,),
+            )
+        self.conn.commit()
+        return len(merges)
 
     def get_or_create_building(self, raw_address: str) -> int:
         """Dedup by normalized_address. Returns building_id."""

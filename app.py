@@ -26,7 +26,7 @@ st.set_page_config(page_title="InspectCopilot", layout="wide")
 store = Store(DB, FAISS)
 
 st.title("InspectCopilot — building defect intelligence")
-view = st.sidebar.radio("View", ["Process", "Browse", "Analytics", "Ask"])
+view = st.sidebar.radio("View", ["Process", "Buildings", "Browse", "Analytics", "Ask"])
 
 if view == "Process":
     st.header("Process inspection reports")
@@ -35,14 +35,72 @@ if view == "Process":
         Path("data/raw").mkdir(parents=True, exist_ok=True)
         dest = Path("data/raw") / up.name
         dest.write_bytes(up.getbuffer())
-        with st.spinner("Ingesting, extracting, embedding…"):
+        with st.spinner("Ingesting, extracting, embedding, geocoding…"):
             stats = process_pdf(dest, store)
-        st.success(f"{stats['observations']} observations from {stats['chunks']} chunks "
-                   f"(OCR used: {stats['ocr_used']})")
+        st.success(
+            f"{stats['observations']} observations from {stats['chunks']} chunks · "
+            f"OCR used: {stats['ocr_used']} · "
+            f"geocoded: {stats['geocoded']} · "
+            f"buildings merged: {stats['buildings_merged']}"
+        )
     log = store.sql("SELECT status, COUNT(*) n FROM extraction_log GROUP BY status")
     if log:
         st.subheader("Extraction log")
         st.table(pd.DataFrame([dict(r) for r in log]))
+
+elif view == "Buildings":
+    st.header("Buildings")
+    buildings = store.sql(
+        "SELECT b.building_id, "
+        "       COALESCE(b.canonical_address, b.raw_address) AS display_name, "
+        "       b.raw_address, b.canonical_address, "
+        "       b.latitude, b.longitude, b.country, "
+        "       COUNT(o.obs_id) AS n_obs "
+        "FROM buildings b LEFT JOIN observations o ON o.building_id = b.building_id "
+        "GROUP BY b.building_id ORDER BY n_obs DESC, b.building_id"
+    )
+    if not buildings:
+        st.info("No buildings yet — process a report first.")
+    else:
+        options = {f"{b['display_name']}  ({b['n_obs']} defects)": b['building_id']
+                   for b in buildings}
+        choice = st.selectbox("Select building", list(options.keys()))
+        row = next(b for b in buildings if b['building_id'] == options[choice])
+
+        st.subheader(row['display_name'])
+        # Show original extraction when LLM dedup renamed it (audit visibility)
+        if row['canonical_address'] and row['canonical_address'] != row['raw_address']:
+            st.caption(f"Originally extracted as: \"{row['raw_address']}\"")
+
+        if row['latitude'] is not None and row['longitude'] is not None:
+            coord_str = f"📍 {row['latitude']:.5f}, {row['longitude']:.5f}"
+            if row['country']:
+                coord_str += f"  ·  {row['country']}"
+            st.caption(coord_str)
+
+            import folium
+            from streamlit_folium import st_folium
+            m = folium.Map(location=[row['latitude'], row['longitude']], zoom_start=17)
+            folium.Marker(
+                [row['latitude'], row['longitude']],
+                popup=row['display_name'],
+                tooltip=row['display_name'],
+            ).add_to(m)
+            st_folium(m, width=700, height=400, returned_objects=[])
+        else:
+            st.warning("This building's address could not be geocoded — no map available.")
+
+        obs = store.sql(
+            "SELECT page, defect_type, building_element, material, severity, "
+            "       confidence, verbatim_quote "
+            "FROM observations WHERE building_id = ? ORDER BY page",
+            (row['building_id'],),
+        )
+        st.subheader(f"Defects ({len(obs)})")
+        if obs:
+            st.dataframe(pd.DataFrame([dict(r) for r in obs]), use_container_width=True)
+        else:
+            st.info("No defects linked to this building.")
 
 elif view == "Browse":
     st.header("Observations")

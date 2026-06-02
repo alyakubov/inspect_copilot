@@ -9,3 +9,6 @@ sentence-transformers>=3.0
 streamlit>=1.36
 pandas>=2.2
 python-dotenv>=1.0
+geopy>=2.4
+folium>=0.17
+streamlit-folium>=0.20
