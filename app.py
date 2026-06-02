@@ -81,12 +81,22 @@ elif view == "Buildings":
             import folium
             from streamlit_folium import st_folium
             m = folium.Map(location=[row['latitude'], row['longitude']], zoom_start=17)
-            folium.Marker(
-                [row['latitude'], row['longitude']],
+            # CircleMarker uses inline SVG — avoids the broken-image flash on
+            # first mount that folium.Marker exhibits inside Streamlit's iframe.
+            folium.CircleMarker(
+                location=[row['latitude'], row['longitude']],
+                radius=9,
+                color="#1f77b4",
+                weight=2,
+                fill=True,
+                fill_color="#1f77b4",
+                fill_opacity=0.7,
                 popup=row['display_name'],
                 tooltip=row['display_name'],
             ).add_to(m)
-            st_folium(m, width=700, height=400, returned_objects=[])
+            # Stable key per building -> clean iframe mount each selection
+            st_folium(m, width=700, height=400, returned_objects=[],
+                      key=f"building_map_{row['building_id']}")
         else:
             st.warning("This building's address could not be geocoded — no map available.")
 
