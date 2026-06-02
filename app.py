@@ -98,7 +98,11 @@ elif view == "Buildings":
         )
         st.subheader(f"Defects ({len(obs)})")
         if obs:
-            st.dataframe(pd.DataFrame([dict(r) for r in obs]), use_container_width=True)
+            # st.table renders as a full HTML table — text columns wrap naturally
+            # so the verbatim_quote is readable in full. Loses sort/filter UX, but
+            # per-building defect counts are small (this is fine here; Browse uses
+            # st.dataframe for the full-corpus case where filtering matters).
+            st.table(pd.DataFrame([dict(r) for r in obs]))
         else:
             st.info("No defects linked to this building.")
 
