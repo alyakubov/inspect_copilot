@@ -78,25 +78,32 @@ elif view == "Buildings":
                 coord_str += f"  ·  {row['country']}"
             st.caption(coord_str)
 
-            import folium
-            from streamlit_folium import st_folium
-            m = folium.Map(location=[row['latitude'], row['longitude']], zoom_start=17)
-            # CircleMarker uses inline SVG — avoids the broken-image flash on
-            # first mount that folium.Marker exhibits inside Streamlit's iframe.
-            folium.CircleMarker(
-                location=[row['latitude'], row['longitude']],
-                radius=9,
-                color="#1f77b4",
-                weight=2,
-                fill=True,
-                fill_color="#1f77b4",
-                fill_opacity=0.7,
-                popup=row['display_name'],
-                tooltip=row['display_name'],
-            ).add_to(m)
-            # Stable key per building -> clean iframe mount each selection
-            st_folium(m, width=700, height=400, returned_objects=[],
-                      key=f"building_map_{row['building_id']}")
+            tab_2d, tab_3d = st.tabs(["2D map", "3D view"])
+            with tab_2d:
+                import folium
+                from streamlit_folium import st_folium
+                m = folium.Map(location=[row['latitude'], row['longitude']], zoom_start=17)
+                # CircleMarker uses inline SVG — avoids the broken-image flash
+                # on first mount that folium.Marker exhibits in Streamlit's iframe.
+                folium.CircleMarker(
+                    location=[row['latitude'], row['longitude']],
+                    radius=9,
+                    color="#1f77b4",
+                    weight=2,
+                    fill=True,
+                    fill_color="#1f77b4",
+                    fill_opacity=0.7,
+                    popup=row['display_name'],
+                    tooltip=row['display_name'],
+                ).add_to(m)
+                st_folium(m, width=700, height=500, returned_objects=[],
+                          key=f"building_map_{row['building_id']}")
+            with tab_3d:
+                from inspect_copilot.cesium import viewer_html
+                st.components.v1.html(
+                    viewer_html(row['latitude'], row['longitude'], row['display_name']),
+                    height=520,
+                )
         else:
             st.warning("This building's address could not be geocoded — no map available.")
 
