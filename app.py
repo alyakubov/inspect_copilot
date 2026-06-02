@@ -7,6 +7,7 @@ Four views, each mapping to a piece of the design:
 """
 
 from html import escape as html_escape
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,6 +32,35 @@ DB = "data/db/inspect_copilot.sqlite"
 FAISS = "data/db/vectors.faiss"
 
 st.set_page_config(page_title="InspectCopilot", layout="wide")
+
+
+def _require_login() -> None:
+    """Gate the app behind USER_LOGIN / USER_PASSWORD from .env.
+
+    If either variable is empty or absent, no login is required. Otherwise the
+    user must enter matching credentials before any view renders.
+    """
+    user = os.environ.get("USER_LOGIN")
+    pwd = os.environ.get("USER_PASSWORD")
+    if not user or not pwd:
+        return
+    if st.session_state.get("authenticated"):
+        return
+    st.title("InspectCopilot — sign in")
+    with st.form("login_form"):
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        if st.form_submit_button("Log in"):
+            if u == user and p == pwd:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+    st.stop()
+
+
+_require_login()
+
 store = Store(DB, FAISS)
 
 st.title("InspectCopilot — building defect intelligence")
@@ -40,18 +70,25 @@ if view == "Process":
     st.header("Process inspection reports")
     up = st.file_uploader("Upload a report PDF", type="pdf")
     if up and st.button("Run pipeline"):
-        Path("data/raw").mkdir(parents=True, exist_ok=True)
-        dest = Path("data/raw") / up.name
-        dest.write_bytes(up.getbuffer())
-        with st.spinner("Ingesting, extracting, embedding, geocoding…"):
-            stats = process_pdf(dest, store)
-        st.success(
-            f"{stats['observations']} observations from {stats['chunks']} chunks · "
-            f"OCR used: {stats['ocr_used']} · "
-            f"geocoded: {stats['geocoded']} · "
-            f"buildings merged: {stats['buildings_merged']} · "
-            f"flagged for review: {stats['buildings_flagged']}"
-        )
+        already = store.sql("SELECT 1 FROM documents WHERE source_file = ?", (up.name,))
+        if already:
+            st.error(
+                f"“{up.name}” has already been processed. "
+                "Delete it in **Processed reports** below before loading it again."
+            )
+        else:
+            Path("data/raw").mkdir(parents=True, exist_ok=True)
+            dest = Path("data/raw") / up.name
+            dest.write_bytes(up.getbuffer())
+            with st.spinner("Ingesting, extracting, embedding, geocoding…"):
+                stats = process_pdf(dest, store)
+            st.success(
+                f"{stats['observations']} observations from {stats['chunks']} chunks · "
+                f"OCR used: {stats['ocr_used']} · "
+                f"geocoded: {stats['geocoded']} · "
+                f"buildings merged: {stats['buildings_merged']} · "
+                f"flagged for review: {stats['buildings_flagged']}"
+            )
     log = store.sql("SELECT status, COUNT(*) stats FROM extraction_log GROUP BY status")
     if log:
         st.subheader("Extraction log")
@@ -83,16 +120,19 @@ if view == "Process":
             else:
                 cols[3].caption("file missing")
             if cols[4].button("🗑 Delete", key=f"del_report_{d['report_id']}"):
-                stats = store.delete_report(d['source_file'])
-                if pdf_path.exists():
-                    pdf_path.unlink()
-                st.toast(
-                    f"Deleted #{d['report_id']}: "
-                    f"{stats['observations']} obs, {stats['chunks']} chunks, "
-                    f"{stats['buildings_deleted']} buildings, "
-                    f"{stats['audit_cleaned']} audit entries"
-                )
-                st.rerun()
+                if os.environ.get("NO_DELETE_REPORT", "").strip().lower() == "true":
+                    st.warning("Report deletion is disabled (NO_DELETE_REPORT=true).")
+                else:
+                    stats = store.delete_report(d['source_file'])
+                    if pdf_path.exists():
+                        pdf_path.unlink()
+                    st.toast(
+                        f"Deleted #{d['report_id']}: "
+                        f"{stats['observations']} obs, {stats['chunks']} chunks, "
+                        f"{stats['buildings_deleted']} buildings, "
+                        f"{stats['audit_cleaned']} audit entries"
+                    )
+                    st.rerun()
 
 elif view == "Buildings":
     st.header("Buildings")
