@@ -370,10 +370,32 @@ elif view == "Analytics":
 
 elif view == "Ask":
     st.header("Ask the corpus (semantic)")
-    st.caption("For fuzzy/open-ended questions. Use Analytics for exact counts.")
-    q = st.text_input("Question", placeholder="Which reports mention chloride-induced corrosion?")
+    st.caption("For fuzzy/open-ended questions. Use Analytics for exact counts. "
+               "You can refer to reports by number (e.g. \"report 1\") — see the IDs "
+               "in Browse/Analytics.")
+
+    # Example questions — click to populate the field. Keep the report-number
+    # example first so users discover that ordinal references work.
+    examples = [
+        "What is the most serious defect in report 1?",
+        "Which reports mention chloride-induced corrosion?",
+        "Summarize the ventilation problems in the child care center.",
+    ]
+    st.caption("Examples (click to use):")
+    ex_cols = st.columns(len(examples))
+    for i, ex in enumerate(examples):
+        if ex_cols[i].button(ex, key=f"ask_ex_{i}"):
+            st.session_state["ask_q"] = ex
+
+    q = st.text_input(
+        "Question",
+        key="ask_q",
+        placeholder="What is the most serious defect in report 1?",
+    )
     if q:
         with st.spinner("Retrieving…"):
             res = query.answer_semantic(store, q)
+        if res.get("scope"):
+            st.caption("Scoped to: " + ", ".join(res["scope"]))
         st.write(res["answer"])
         st.caption("Sources: " + ", ".join(res["sources"]))

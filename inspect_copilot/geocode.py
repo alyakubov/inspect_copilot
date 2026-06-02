@@ -25,6 +25,33 @@ _geocoder = Nominatim(user_agent=_USER_AGENT)
 _rate_limited_geocode = RateLimiter(_geocoder.geocode, min_delay_seconds=1.0)
 
 
+def geocode_address(address: str) -> tuple[float, float, str | None] | None:
+    """Resolve one address string to (latitude, longitude, country_code).
+
+    Returns None when the address can't be resolved or the lookup errors —
+    callers treat that as "unknown", never as a failure. Single chokepoint so
+    both the ingest geocoding pass and the merge-verification guard share the
+    same rate limiter and US bias.
+    """
+    try:
+        # country_codes biases Nominatim to US results — matches the MVP scope
+        # (US public buildings). Drop or extend (e.g. ["us","be","nl","fr"]) to
+        # geocode reports from other countries.
+        loc = _rate_limited_geocode(
+            address,
+            addressdetails=True,
+            country_codes=["us"],
+            timeout=10,
+        )
+    except Exception as e:  # noqa: BLE001 — never let geocoding break ingest
+        _log.warning("geocoding failed for %r: %s", address, e)
+        return None
+    if loc is None:
+        return None
+    country = (loc.raw.get("address") or {}).get("country_code")
+    return loc.latitude, loc.longitude, country.upper() if country else None
+
+
 def geocode_pending(store: Store) -> dict:
     """Fill lat/lon/country for buildings where latitude is NULL.
 
@@ -41,27 +68,15 @@ def geocode_pending(store: Store) -> dict:
     resolved = 0
     for r in rows:
         attempted += 1
-        try:
-            # country_codes biases Nominatim to US results — matches the MVP scope
-            # (US public buildings). Drop or extend (e.g. ["us","be","nl","fr"]) to
-            # geocode reports from other countries.
-            loc = _rate_limited_geocode(
-                r["address"],
-                addressdetails=True,
-                country_codes=["us"],
-                timeout=10,
-            )
-        except Exception as e:  # noqa: BLE001 — never let geocoding break ingest
-            _log.warning("geocoding failed for %r: %s", r["address"], e)
+        geo = geocode_address(r["address"])
+        if geo is None:
             continue
-        if loc is None:
-            continue
-        country = (loc.raw.get("address") or {}).get("country_code")
+        lat, lon, country = geo
         store.update_building_coords(
             building_id=r["building_id"],
-            latitude=loc.latitude,
-            longitude=loc.longitude,
-            country=country.upper() if country else None,
+            latitude=lat,
+            longitude=lon,
+            country=country,
         )
         resolved += 1
     return {"attempted": attempted, "resolved": resolved}

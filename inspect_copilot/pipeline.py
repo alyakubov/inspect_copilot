@@ -63,6 +63,9 @@ def process_pdf(pdf_path: str | Path, store: Store) -> dict:
     #   1. semantic dedup (LLM) — collapses same-building references that differ
     #      arbitrarily (e.g. 'Garmatz Courthouse' + 'Bankruptcy Courthouse'); uses
     #      world knowledge of US public buildings and writes a canonical_address.
+    #      Each proposed merge is geo-verified (members geocoded independently;
+    #      groups that resolve far apart are rejected) so a confident-but-wrong
+    #      LLM guess can't fuse two different buildings.
     #   2. geocode — runs on canonical_address when set, raw_address otherwise.
     #   3. coord-based merge — for buildings the LLM missed but that geocoded to
     #      the same lat/lon.
@@ -81,6 +84,7 @@ def process_pdf(pdf_path: str | Path, store: Store) -> dict:
         "geocoded": f"{geo['resolved']}/{geo['attempted']}",
         "buildings_merged": sem["merged"] + merged_by_coord + merged_by_name,
         "buildings_flagged": sem["concerns"],
+        "merges_rejected_geo": sem.get("rejected_geo", 0),
     }
 
 

@@ -406,6 +406,59 @@ class Store:
         )
         self.conn.commit()
 
+    def split_building_by_source(
+        self,
+        building_id: int,
+        source_file: str,
+        new_raw_address: str,
+        canonical_address: str | None = None,
+    ) -> int | None:
+        """Undo an over-eager merge by moving one report's observations out.
+
+        Every observation currently on `building_id` whose source_file matches
+        `source_file` is repointed at a separate building (the one keyed to
+        `new_raw_address`, created if it doesn't exist). The destination's
+        coords are cleared so geocode_pending re-resolves them from the correct
+        address. The action is logged in extraction_log for audit.
+
+        Returns the destination building_id, or None if there was nothing to
+        move (no matching observations) or the destination would be the source
+        itself.
+        """
+        n = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM observations WHERE building_id=? AND source_file=?",
+            (building_id, source_file),
+        ).fetchone()["n"]
+        if not n:
+            return None
+
+        dest = self.get_or_create_building(new_raw_address)
+        if dest == building_id:
+            return None
+
+        if canonical_address:
+            self.conn.execute(
+                "UPDATE buildings SET canonical_address=? WHERE building_id=?",
+                (canonical_address, dest),
+            )
+        # Force re-geocoding from the (now correct) destination address.
+        self.conn.execute(
+            "UPDATE buildings SET latitude=NULL, longitude=NULL, country=NULL WHERE building_id=?",
+            (dest,),
+        )
+        self.conn.execute(
+            "UPDATE observations SET building_id=? WHERE building_id=? AND source_file=?",
+            (dest, building_id, source_file),
+        )
+        self.conn.execute(
+            "INSERT INTO extraction_log (chunk_id,status,detail) VALUES (?,?,?)",
+            (-1, "manual_split",
+             f"moved {n} obs of source_file={source_file!r} from building_id={building_id} "
+             f"to building_id={dest} raw={new_raw_address!r}"),
+        )
+        self.conn.commit()
+        return dest
+
     def merge_similar_named_buildings(self) -> int:
         """Merge buildings whose extracted names look like the same place under
         a shorter or abbreviated form (see _names_likely_same_building).
@@ -608,11 +661,28 @@ class Store:
         """
         return self.conn.execute(query, params).fetchall()
 
-    def search(self, query_vec: np.ndarray, k: int = 5) -> list[Chunk]:
-        """Vector search for the fuzzy/semantic follow-up questions (RAG side)."""
+    def search(
+        self,
+        query_vec: np.ndarray,
+        k: int = 5,
+        source_files: list[str] | None = None,
+    ) -> list[Chunk]:
+        """Vector search for the fuzzy/semantic follow-up questions (RAG side).
+
+        When `source_files` is given, results are restricted to chunks from
+        those reports: we search the whole index and keep the top-k matches that
+        belong to the requested files. This lets "…in report 1" actually answer
+        from report 1 rather than from whatever is globally most similar.
+        """
+        n = self.index.ntotal
+        if n == 0:
+            return []
         v = query_vec.astype("float32").reshape(1, -1)
         faiss.normalize_L2(v)
-        _, ids = self.index.search(v, k)
+        # Over-fetch when filtering so we still have k matches after the filter.
+        search_k = min(n, max(k, n)) if source_files else min(n, k)
+        _, ids = self.index.search(v, search_k)
+        allowed = set(source_files) if source_files else None
         out: list[Chunk] = []
         for cid in ids[0]:
             if cid == -1:
@@ -621,6 +691,8 @@ class Store:
                 "SELECT chunk_id,source_file,page,language,text FROM chunks WHERE chunk_id=?",
                 (int(cid),),
             ).fetchone()
-            if r:
+            if r and (allowed is None or r["source_file"] in allowed):
                 out.append(Chunk(r["chunk_id"], r["source_file"], r["page"], r["language"], r["text"]))
+            if len(out) >= k:
+                break
         return out

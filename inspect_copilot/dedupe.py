@@ -16,13 +16,70 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 
 from anthropic import Anthropic
 
+from .geocode import geocode_address
 from .store import Store
 
 _log = logging.getLogger(__name__)
+
+# A merge group is REJECTED when two or more of its members independently
+# geocode to points farther apart than this. The LLM's world knowledge is a
+# guess; an address that resolves a kilometre away is hard evidence the guess
+# is wrong. 250 m comfortably covers a single large federal complex while still
+# catching cross-town hallucinations (e.g. the GSA Headquarters Building at
+# 1800 F St NW vs the William Jefferson Clinton Federal Building at the Federal
+# Triangle, ~1 km apart, which an earlier run wrongly merged).
+_MERGE_MAX_SPREAD_M = 250.0
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon points, in metres."""
+    r = 6_371_000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _geo_consistent(store: Store, alias_ids: list[int]) -> bool:
+    """True unless there is positive geographic evidence the members differ.
+
+    For each member we use its stored coords if known, else geocode its
+    raw_address independently. We REJECT (return False) only when at least two
+    members resolve and the farthest pair exceeds _MERGE_MAX_SPREAD_M. When
+    fewer than two members geocode we cannot disprove the merge, so we allow it
+    — this preserves function-alias merges where one name doesn't geocode
+    (e.g. 'Bankruptcy Courthouse' for the Garmatz courthouse).
+    """
+    if len(alias_ids) < 2:
+        return True
+    placeholders = ",".join("?" * len(alias_ids))
+    rows = store.sql(
+        f"SELECT building_id, raw_address, latitude, longitude "
+        f"FROM buildings WHERE building_id IN ({placeholders})",
+        tuple(alias_ids),
+    )
+    coords: list[tuple[float, float]] = []
+    for r in rows:
+        if r["latitude"] is not None and r["longitude"] is not None:
+            coords.append((r["latitude"], r["longitude"]))
+            continue
+        geo = geocode_address(r["raw_address"])
+        if geo is not None:
+            coords.append((geo[0], geo[1]))
+    if len(coords) < 2:
+        return True
+    spread = max(
+        _haversine_m(*coords[i], *coords[j])
+        for i in range(len(coords))
+        for j in range(i + 1, len(coords))
+    )
+    return spread <= _MERGE_MAX_SPREAD_M
 
 _CLIENT = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 _MODEL = os.environ.get("ANTHROPIC_MODEL")
@@ -110,6 +167,21 @@ def semantic_dedupe(store: Store) -> dict:
         _log.warning("semantic dedup LLM call failed: %s", e)
         return {"merged": 0, "concerns": 0}
 
-    merged = store.apply_canonical_merges(data.get("merges") or [])
+    # Geographic verification: drop any LLM merge whose members independently
+    # geocode far apart. Catches same-named-organisation hallucinations the
+    # prompt can't be trusted to avoid. Rejections are logged, never silent.
+    proposed = data.get("merges") or []
+    verified = []
+    for grp in proposed:
+        if _geo_consistent(store, grp.get("alias_ids") or []):
+            verified.append(grp)
+        else:
+            store.log(
+                -1, "merge_rejected_geo",
+                f"alias_ids={grp.get('alias_ids')} canonical={grp.get('canonical_address')!r} "
+                f"reasoning={grp.get('reasoning','')!r}",
+            )
+
+    merged = store.apply_canonical_merges(verified)
     concerns = store.apply_concerns(data.get("concerns") or [])
-    return {"merged": merged, "concerns": concerns}
+    return {"merged": merged, "concerns": concerns, "rejected_geo": len(proposed) - len(verified)}
