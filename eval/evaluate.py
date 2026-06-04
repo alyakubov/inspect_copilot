@@ -44,9 +44,9 @@ def evaluate(store: Store) -> dict:
         p = Counter((x["source_file"], x["page"], x[field]) for x in pred)
         tp = sum((g & p).values())
         prec = tp / sum(p.values()) if p else 0.0
-        rec = tp / sum(g.values()) if g else 0.0
-        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
-        return {"precision": round(prec, 3), "recall": round(rec, 3), "f1": round(f1, 3)}
+        recall = tp / sum(g.values()) if g else 0.0
+        f1 = 2 * prec * recall / (prec + recall) if (prec + recall) else 0.0
+        return {"precision": round(prec, 3), "recall": round(recall, 3), "f1": round(f1, 3)}
 
     return {"defect_type": score("defect_type"), "severity": score("severity"),
             "n_gold": len(gold), "n_pred": len(pred)}
