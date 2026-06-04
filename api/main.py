@@ -15,7 +15,7 @@ load_dotenv()
 
 from pathlib import Path  # noqa: E402
 
-from fastapi import FastAPI  # noqa: E402
+from fastapi import FastAPI, Response  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import FileResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
@@ -39,6 +39,20 @@ app.add_middleware(
 
 for r in (system, reports, buildings, observations, analytics, ask):
     app.include_router(r.router)
+
+
+# --- legacy load-balancer health probes -----------------------------------
+# This host sits behind a shared Finmars LB that HEAD-probes the previous app's
+# health paths (e.g. "/experts-show?lb", "/risk-company?lb"). InspectCopilot
+# doesn't own those routes, so without this they'd hit the GET-only SPA
+# catch-all and return 405 — which the LB reads as "backend down". Answer them
+# 200 (no auth, GET+HEAD), registered before the catch-all so they win.
+def _lb_health() -> Response:
+    return Response(status_code=200)
+
+
+for _probe in ("/experts-show", "/risk-company"):
+    app.add_api_route(_probe, _lb_health, methods=["GET", "HEAD"], include_in_schema=False)
 
 
 # --- serve the built SPA in production (no-op in dev where Vite serves it) ---
