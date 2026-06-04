@@ -4,6 +4,9 @@ Turn a folder of heterogeneous building-inspection PDFs into a searchable,
 analyzable database of structured defect observations — plus semantic Q&A over
 the raw text.
 
+Demo video: https://youtu.be/AuMfDVgqhyc
+
+
 ## What problem, and for whom?
 
 We have inspection reports as free-text PDFs. Each
