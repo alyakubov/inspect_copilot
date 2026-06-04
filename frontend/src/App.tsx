@@ -18,15 +18,20 @@ import {
   Tooltip,
   Typography,
 } from "@mui/material";
+import { Suspense, lazy } from "react";
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 
 import { useConfig, useLogout } from "./api/hooks";
 import LoginScreen from "./auth/LoginScreen";
-import Analytics from "./pages/Analytics";
-import Ask from "./pages/Ask";
-import Browse from "./pages/Browse";
-import Buildings from "./pages/Buildings";
-import Process from "./pages/Process";
+
+// Route-level code splitting: each page (and its heavy deps — Recharts, Leaflet,
+// react-markdown, the DataGrid) loads only when first navigated to, keeping the
+// initial bundle small.
+const Process = lazy(() => import("./pages/Process"));
+const Buildings = lazy(() => import("./pages/Buildings"));
+const Browse = lazy(() => import("./pages/Browse"));
+const Analytics = lazy(() => import("./pages/Analytics"));
+const Ask = lazy(() => import("./pages/Ask"));
 
 const DRAWER_WIDTH = 220;
 
@@ -97,15 +102,23 @@ export default function App() {
 
       <Box component="main" sx={{ flexGrow: 1, p: 3, width: `calc(100% - ${DRAWER_WIDTH}px)` }}>
         <Toolbar />
-        <Routes>
-          <Route path="/" element={<Navigate to="/process" replace />} />
-          <Route path="/process" element={<Process noDelete={config.no_delete_report} />} />
-          <Route path="/buildings" element={<Buildings />} />
-          <Route path="/browse" element={<Browse />} />
-          <Route path="/analytics" element={<Analytics />} />
-          <Route path="/ask" element={<Ask />} />
-          <Route path="*" element={<Navigate to="/process" replace />} />
-        </Routes>
+        <Suspense
+          fallback={
+            <Box sx={{ display: "flex", justifyContent: "center", mt: 8 }}>
+              <CircularProgress />
+            </Box>
+          }
+        >
+          <Routes>
+            <Route path="/" element={<Navigate to="/process" replace />} />
+            <Route path="/process" element={<Process noDelete={config.no_delete_report} />} />
+            <Route path="/buildings" element={<Buildings />} />
+            <Route path="/browse" element={<Browse />} />
+            <Route path="/analytics" element={<Analytics />} />
+            <Route path="/ask" element={<Ask />} />
+            <Route path="*" element={<Navigate to="/process" replace />} />
+          </Routes>
+        </Suspense>
       </Box>
     </Box>
   );

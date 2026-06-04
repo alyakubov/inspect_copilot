@@ -9,6 +9,8 @@ import {
   Typography,
 } from "@mui/material";
 import { useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import { useAsk } from "../api/hooks";
 
@@ -67,7 +69,33 @@ export default function Ask() {
               Scoped to: {ask.data.scope.join(", ")}
             </Typography>
           )}
-          <Typography sx={{ whiteSpace: "pre-wrap", my: 1 }}>{ask.data.answer}</Typography>
+          <Box
+            sx={{
+              my: 1,
+              "& p": { mt: 0, mb: 1 },
+              "& p:last-child": { mb: 0 },
+              "& ul, & ol": { pl: 3, my: 1 },
+              "& h1, & h2, & h3": { mt: 1.5, mb: 0.5, fontSize: "1.05rem" },
+              "& a": { color: "primary.main" },
+              "& code": {
+                bgcolor: "action.hover",
+                px: 0.5,
+                borderRadius: 0.5,
+                fontSize: "0.85em",
+              },
+              "& table": { borderCollapse: "collapse", my: 1 },
+              "& th, & td": { border: "1px solid", borderColor: "divider", px: 1, py: 0.5 },
+            }}
+          >
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                a: (props) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+              }}
+            >
+              {ask.data.answer}
+            </ReactMarkdown>
+          </Box>
           <Typography variant="caption" color="text.secondary">
             Sources: {ask.data.sources.join(", ")}
           </Typography>

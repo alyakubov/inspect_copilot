@@ -6,47 +6,64 @@ the raw text.
 
 ## What problem, and for whom?
 
-SECO generates large volumes of inspection reports as free-text PDFs. Each
-describes defects (cracks, corrosion, damp, spalling, fire-safety
-non-compliance…), their location, severity, and recommended action. That
-knowledge is locked in prose: you cannot aggregate it, filter it, count it, or
+We have inspection reports as free-text PDFs. Each
+describes defects (cracks, corrosion, damp, fire-safety
+non-compliance…), their location, severity, and recommended action for a 
+number of buildings. 
+That knowledge is locked in prose: you cannot aggregate it, filter it, count it, or
 analyze it across a portfolio.
 
-**Primary user:** the SECO inspector / control engineer.
-**Secondary user:** the asset manager receiving the reports.
+**Primary user:** the insurance specialist or investor (asset manager) receiving the reports.
+**Person who checks the database:** a construction inspector / control engineer.
 
 InspectCopilot extracts every observation into a structured schema, so questions
-like *"the five most frequent defect types on 1960s concrete buildings"* or
+like *"the five most frequent defect types on 1980s concrete buildings"* or
 *"every urgent observation, by element"* become exact queries instead of manual
 re-reading.
 
-## Why is this relevant to SECO?
+## Why is this relevant
 
-The brief's own framing: huge volumes of technical data that "remain largely
+With this app we are trying to resolve the main challenge: extract information from 
+huge volumes of technical data in free-text PDFs that "remain largely
 underexploited." The underexploitation isn't an inability to ask questions —
 it's that the knowledge can't be aggregated. That makes this an **extraction**
-problem first, a retrieval problem second. InspectCopilot attacks exactly that.
+problem first, a retrieval problem second. 
+
+InspectCopilot offers the following functionality:
+- Extraction of building defect from free text PDF reports linked to the building
+- Person who supervises database should check that the building was geolocated correctly
+- User (investor or insurance manager) can see the buildings in 2D maps and in 3D views with 
+the defect list from the inspection reports.
+- User can filter all defects in the portfolio by their severity
+and by other params like reports and defect type. Charts are available in Analytics section.
+- And, of course, user can ask any question like
+*"Give me a summary for urgent severity defects for the whole portfolio"*.
 
 ## Data sources
+We used public inspection and validation reports of US Office of Inspector General.
+They are all in free-text PDF with one report covering sometimes multiple buildings.
 
-Public, reproducible inspection/condition reports in EN/FR/NL (matching SECO's
-Benelux footprint): municipal building audits, published façade and fire-safety
-inspections, and infrastructure condition reports. Heterogeneity — born-digital
-vs scanned, multilingual, varied layouts — is intentional: handling it is the
-point.
+The reports concern federal property, so our app can be also useful for:
+- Insurance specialists working with the federal government
+- Investors planning participate in the privatisation
+
+https://www.gsaig.gov/inspection-and-evaluation-report 
+
 
 ## Architecture
 
-One upfront pass over each PDF builds **two indexes**:
+One upfront pass over each PDF builds **two indexes** and geolocation as building index extension:
 
-| Index | Built by | Answers | How |
-|-------|----------|---------|-----|
-| **1. Structured rows** (SQLite) | LLM extraction → Pydantic validation | count / group / filter / rank | exact SQL over *all* rows |
-| **2. Vectors** (FAISS) | sentence-transformers embeddings | fuzzy / open-ended follow-ups | top-k retrieval → LLM (RAG) |
+| Index                                 | Built by                                   | Answers | How                         |
+|---------------------------------------|--------------------------------------------|---------|-----------------------------|
+| **1. Structured rows** (SQLite)       | LLM extraction → Pydantic validation       | count / group / filter / rank | exact SQL over *all* rows   |
+| **2. Text vectors** (FAISS)           | sentence-transformers embeddings           | fuzzy / open-ended follow-ups | top-k retrieval → LLM (RAG) |
+| **3. Geolocation** (checked by human) | building address (not full) → coordinates | association of the building from different reports | free or paid services       |
 
 The expensive LLM call happens **once per chunk at ingestion**, never per
 question and never over a whole file. Aggregation questions hit SQL (exact,
-complete, auditable); only genuinely semantic questions use RAG.
+complete, auditable); only genuinely semantic questions use RAG. 
+We spend <0.01 USD per report.
 
 **Why not RAG for everything?** Retrieval returns a top-k *subset*, so "how many
 urgent defects across 40 reports" becomes a guess. `SELECT COUNT(*)` over the
@@ -55,49 +72,77 @@ questions — so it's additive, not the spine.
 
 ```
 ingest (text layer + OCR fallback) → chunk + language-detect
-   → LLM extract → validate → SQLite        [Index 1]
-   → embed       →            FAISS          [Index 2]
+   → LLM extract → geolocation → SQLite        [Index 1]
+   → embedding   → chunk link  → FAISS         [Index 2]
 ```
 
 ## Technical decisions & trade-offs
 
-- **SQLite + FAISS, not Postgres + pgvector.** At 15–40 reports (a few thousand
+- **SQLite + FAISS, not Postgres + pgvector/ ChromaDB.** At 15–40 reports (a few thousand
   vectors) Postgres is premature; SQLite is a single reproducible file. The
   storage layer (`store.py`) is a thin interface, so migrating to pgvector at
   portfolio scale means rewriting one file. Trade-off: no concurrent writers,
   no ANN index — both irrelevant at this scale.
-- **React + FastAPI (migrated from Streamlit).** The UI is a React/TypeScript
-  SPA (Vite + MUI) talking to a thin FastAPI wrapper around the same engine.
+- **Multi-language embedding bge-m3.** Local deployment (implies no payments). 
+  Better performance for FR/NL compared to LlamaIndex's default embedder. 
+  Large BERT position table limit of more than 700 words fully covering our page chunks. 
+- **React + FastAPI (migrated from Streamlit).** 
   Streamlit got to usable fastest; the React frontend is the production-shaped
-  rebuild on SECO's stack. The engine (extraction, SQL, FAISS, geocoding,
+  rebuild on traditional stack. The engine (extraction, SQL, FAISS, geocoding,
   dedup) is unchanged — FastAPI just exposes it over JSON. The old `app.py`
   Streamlit UI is retained for reference but is no longer the entry point.
 - **Controlled vocabulary in the schema.** Enums make aggregation meaningful
   but lose nuance; free-text fields (`recommended_action`, `location`) keep it.
 - **Validation quarantine, not silent drops.** Failed extractions go to
-  `extraction_log`, so robustness is measurable, not hidden.
+  `extraction_log`, so robustness is measurable, not hidden. 
+Every observation carries a verbatim quote + page
+for audit.
+- **Deduplication of buildings, geolocation.** Building deduplication is 
+a crucial challenge solved with additional LLM request, geolocation check
+and human control.
 
-## Evaluation & limits
+## Evaluation & limits (plain FAISS vs LlamaIndex)
 
 A hand-labelled gold set (`eval/`) measures extraction precision/recall on
-`defect_type` and `severity`. Known failure modes: severity is subjective; OCR
-garbles tables; the model is prompted **not** to invent regulatory references
-(a real hallucination risk). Every observation carries a verbatim quote + page
-for audit.
+`defect_type` and `severity`. 
+Although detailed analysis was not conducted due to lack of time, 
+visual analysis shows reasonable extraction
+
+Known **limitations** of FAISS compared to LlamaIndex:
+1. Plain FAISS split to chunks is based on pages, not on text sections/structure. 
+LlamaIndex implements text structure split by default with section overlaps, 
+metadata and cross-section links. However, OCR extraction degrades the structure
+of the documents (which can be seen in HTML/Markdown).
+Thus for our specific tasks FAISS may have chance to keep in line with LlamaIndex.
+2. We use plain nearest-neighbour index for RAG instead of LlamaIndex's ANN concept useful for
+larger datasets. It gives us higher retrieval precision at the expense of delays, 
+which are immaterial given our dataset size.
+
+Where FAISS still can outperform LlamaIndex:
+1. With fixed chunk of 1 page we control the limit of position table for BERT-embeddings
+per chunk. With more sophisticated chunk split there is a risk that some chunk tails are
+ignored by the index.
+2. Small dataset based on SQL extraction and FAISS shows smaller execution delays
+compared to LlamaIndex, which is designed for larger datasets. 
 
 ## Production tomorrow vs. throw away
 
-**Ship:** the extraction schema, validation/quarantine layer, SQL aggregation,
-verbatim-quote traceability.
-**Throw away:** any extraction not backed by a source quote; OCR without a
-quality gate; naive RAG without the eval.
+**Keep in production:** the extraction schema, validation/quarantine layer, SQL aggregation,
+verbatim-quote traceability, geolocation with human in the loop, 
+2D/3D building views for the end-users.
+
+**Throw away:** any extraction not backed by a double check on two LLMs ; OCR without a
+quality gate; RAG without the eval (to be conducted, code available).
 
 ## If I had 3 months
 
-Human-in-the-loop correction (inspectors fix extractions; corrections fine-tune
-the extractor); section-aware chunking; computer-vision defect detection from
-inspection **photos** (cracks, spalling, corrosion); migration to Postgres +
-pgvector; cross-report portfolio risk patterns.
+- Migration to Postgres+pgvector (<5M chunks) or to Spark+Qdrant(>5M chunks) 
+- Section-aware chunking (switch to LlamaIndex), embedding trade-off
+of position table limit vs chunk size.
+- Computer-vision defect detection from inspection **photos** (cracks, spalling, corrosion);
+- Additional human-in-the-loop correction (inspectors fix extractions; corrections fine-tune
+the extractor); 
+- Research on cross-report portfolio risk patterns (what are the most usual defects of 1980s buildings).
 
 ## Run
 

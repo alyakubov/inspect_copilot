@@ -16,16 +16,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sentence_transformers import SentenceTransformer
 from pydantic import ValidationError
 
 from .ingest import ingest
 from .extract import extract
 from .dedupe import semantic_dedupe
+from .embedding import embed
 from .geocode import geocode_pending
 from .store import Store
-
-_EMBEDDER = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")  # 384-dim, free, local
 
 
 def process_pdf(pdf_path: str | Path, store: Store) -> dict:
@@ -38,8 +36,8 @@ def process_pdf(pdf_path: str | Path, store: Store) -> dict:
     for ch in chunks:
         chunk_id = store.add_chunk(pdf_path.name, ch.page, ch.language, ch.text)
 
-        # Index 2: embedding (always succeeds, cheap, local)
-        vec = _EMBEDDER.encode(ch.text)
+        # Index 2: embedding (always succeeds, local)
+        vec = embed(ch.text)
         store.add_vector(chunk_id, vec)
 
         # Index 1: structured extraction (validated; failures quarantined)

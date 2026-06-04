@@ -10,6 +10,8 @@ rather than hand-wavy.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +20,8 @@ import faiss
 import numpy as np
 
 from .schema import Observation
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -148,11 +152,20 @@ def _names_likely_same_building(a: str, b: str) -> bool:
 
 
 class Store:
-    def __init__(self, db_path: str | Path, faiss_path: str | Path, dim: int = 384):
+    def __init__(self, db_path: str | Path, faiss_path: str | Path, dim: int | None = None):
         self.db_path = str(db_path)
         self.faiss_path = str(faiss_path)
-        self.dim = dim
-        self.conn = sqlite3.connect(self.db_path)
+        # Vector width for the FAISS index. Defaults to EMBED_DIM (the embedding
+        # model's output dim) so the index always matches the active model.
+        self.dim = dim if dim is not None else int(os.environ.get("EMBED_DIM", "1024"))
+        # check_same_thread=False: FastAPI runs sync endpoints/dependencies in an
+        # anyio worker-thread pool, so one request's Store may be created on one
+        # worker thread and queried/closed on another. SQLite's default
+        # thread-affinity check would reject that. Each request still gets its
+        # OWN Store (own connection) via the API's get_store dependency — we are
+        # not sharing one connection across threads — so the library's serialized
+        # threading mode handles this safely.
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA_SQL)
         self._migrate_observations_building_id()
@@ -160,8 +173,14 @@ class Store:
         # FAISS index keyed by chunk_id (IDMap lets us store our own ids)
         if Path(self.faiss_path).exists():
             self.index = faiss.read_index(self.faiss_path)
+            if self.index.d != self.dim:
+                _log.warning(
+                    "FAISS index at %s has dim %d but EMBED_DIM is %d — the "
+                    "embedding model changed; run scripts/reindex_embeddings.py.",
+                    self.faiss_path, self.index.d, self.dim,
+                )
         else:
-            self.index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
+            self.index = faiss.IndexIDMap(faiss.IndexFlatIP(self.dim))
 
     def _migrate_observations_building_id(self) -> None:
         """Add observations.building_id on pre-existing DBs without wiping data."""

@@ -14,12 +14,11 @@ import os
 import re
 
 from anthropic import Anthropic
-from sentence_transformers import SentenceTransformer
 
+from .embedding import embed
 from .store import Store
 
 _CLIENT = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-_EMBEDDER = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 _MODEL = os.environ.get("ANTHROPIC_MODEL")
 if not _MODEL:
     raise RuntimeError(
@@ -128,7 +127,7 @@ def answer_semantic(store: Store, question: str, k: int = 5) -> dict:
     directory = report_directory(store)
     target_sources = resolve_report_references(question, directory)
 
-    qvec = _EMBEDDER.encode(question)
+    qvec = embed(question)
     hits = store.search(qvec, k=k, source_files=target_sources or None)
     context = "\n\n".join(f"[{h.source_file} p.{h.page}] {h.text}" for h in hits)
 
