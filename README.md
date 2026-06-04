@@ -13,8 +13,8 @@ number of buildings.
 That knowledge is locked in prose: you cannot aggregate it, filter it, count it, or
 analyze it across a portfolio.
 
-**Primary user:** the insurance specialist or investor (asset manager) receiving the reports.
-**Person who checks the database:** a construction inspector / control engineer.
+- **Primary user:** the insurance specialist or investor (asset manager) receiving the reports.
+- **Person who checks the database:** a construction inspector / control engineer.
 
 InspectCopilot extracts every observation into a structured schema, so questions
 like *"the five most frequent defect types on 1980s concrete buildings"* or
@@ -139,10 +139,11 @@ quality gate; RAG without the eval (to be conducted, code available).
 - Migration to Postgres+pgvector (<5M chunks) or to Spark+Qdrant(>5M chunks) 
 - Section-aware chunking (switch to LlamaIndex), embedding trade-off
 of position table limit vs chunk size.
-- Computer-vision defect detection from inspection **photos** (cracks, spalling, corrosion);
+- Computer-vision defect detection from inspection **photos** (cracks, corrosion);
 - Additional human-in-the-loop correction (inspectors fix extractions; corrections fine-tune
 the extractor); 
-- Research on cross-report portfolio risk patterns (what are the most usual defects of 1980s buildings).
+- Research on cross-report portfolio risk patterns 
+(*What are the most typical defects of 1980s buildings*).
 
 ## Run
 
